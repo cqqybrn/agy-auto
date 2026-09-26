@@ -82,6 +82,7 @@ export function getPrefs() {
     defaultModel: null,
     defaultEffort: null,
     defaultCwd: null,
+    defaultAgent: null,
   });
 }
 
@@ -101,4 +102,24 @@ export function resolveDefaultModel(explicit) {
     return explicit;
   }
   return getPrefs().defaultModel || undefined;
+}
+
+/**
+ * Prefer explicit agent → prefs → AGY_DEFAULT_AGENT → bundled agy-fast.
+ * Pass null/""/"default"/"builtin" to force the built-in default agent (no --agent flag).
+ */
+export function resolveDefaultAgent(explicit) {
+  const raw =
+    explicit !== undefined && explicit !== null
+      ? String(explicit).trim()
+      : "";
+  if (raw === "default" || raw === "builtin" || raw === "-") return undefined;
+  if (raw && raw !== "agy" && raw !== "antigravity") return raw;
+  const pref = getPrefs().defaultAgent;
+  if (pref === "default" || pref === "builtin" || pref === "-") return undefined;
+  if (pref && String(pref).trim()) return String(pref).trim();
+  const env = (process.env.AGY_DEFAULT_AGENT || "").trim();
+  if (env === "default" || env === "builtin" || env === "-") return undefined;
+  if (env) return env;
+  return "agy-fast";
 }

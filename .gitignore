@@ -3,3 +3,5 @@ node_modules/
 *.log
 accounts/
 !accounts/.gitkeep
+.agy-uploads/
+.agy-oauth-chrome/

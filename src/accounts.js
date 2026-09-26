@@ -1,8 +1,9 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -86,11 +87,59 @@ function decodeJwtEmail(idToken) {
   }
 }
 
+/** Parse live OAuth JSON stored inside Windows Credential Manager blob. */
+function readWinCredOAuth() {
+  try {
+    const cred = runWinCred("read");
+    if (!cred.exists || !cred.blobB64) return null;
+    const text = Buffer.from(cred.blobB64, "base64").toString("utf8");
+    const obj = JSON.parse(text);
+    if (!obj || typeof obj !== "object") return null;
+    return { cred, oauth: obj };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Newer CLI logins often only write WinCred, not ~/.gemini/oauth_creds.json.
+ * Mirror the blob into the files our UI / save path expect.
+ */
+export function syncLiveOAuthFilesFromWinCred() {
+  const packed = readWinCredOAuth();
+  if (!packed) return null;
+  const { oauth } = packed;
+  const email =
+    decodeJwtEmail(oauth.id_token) ||
+    decodeJwtEmail(oauth.token?.id_token) ||
+    oauth.email ||
+    null;
+
+  ensureDir(GEMINI_DIR);
+  writeJson(OAUTH_CREDS, oauth);
+  if (email) {
+    const ga = readJson(GOOGLE_ACCOUNTS, {}) || {};
+    writeJson(GOOGLE_ACCOUNTS, { ...ga, active: email, old: ga.old || [] });
+  }
+  return { email, oauth };
+}
+
 function currentEmail() {
   const ga = readJson(GOOGLE_ACCOUNTS, {});
   if (ga?.active) return ga.active;
   const oauth = readJson(OAUTH_CREDS, {});
-  return decodeJwtEmail(oauth?.id_token);
+  const fromFile = decodeJwtEmail(oauth?.id_token);
+  if (fromFile) return fromFile;
+
+  // Fallback: CLI login may only live in WinCred
+  const packed = readWinCredOAuth();
+  if (!packed) return null;
+  return (
+    decodeJwtEmail(packed.oauth.id_token) ||
+    decodeJwtEmail(packed.oauth.token?.id_token) ||
+    packed.oauth.email ||
+    null
+  );
 }
 
 function profileDir(name) {
@@ -106,6 +155,15 @@ export function listProfiles() {
     .readdirSync(ACCOUNTS_DIR, { withFileTypes: true })
     .filter((d) => d.isDirectory())
     .map((d) => d.name)
+    // Only real saved profiles (Chrome user-data dirs etc. must not appear)
+    .filter((name) => {
+      const dir = profileDir(name);
+      return (
+        fs.existsSync(path.join(dir, "meta.json")) ||
+        fs.existsSync(path.join(dir, "wincred.b64")) ||
+        fs.existsSync(path.join(dir, "api_key.txt"))
+      );
+    })
     .sort();
   return names.map((name) => {
     const meta = readJson(path.join(profileDir(name), "meta.json"), {});
@@ -157,6 +215,8 @@ export function saveAccount(name, { asApiKey, apiKey, note } = {}) {
     );
   }
 
+  // Ensure sidecar files exist even when CLI only wrote WinCred
+  syncLiveOAuthFilesFromWinCred();
   const email = currentEmail();
   writeJson(path.join(dir, "meta.json"), {
     type: "oauth",
@@ -168,11 +228,19 @@ export function saveAccount(name, { asApiKey, apiKey, note } = {}) {
   });
   fs.writeFileSync(path.join(dir, "wincred.b64"), cred.blobB64, "utf8");
 
+  // Always snapshot oauth from live files (now synced) or directly from blob
   if (fs.existsSync(OAUTH_CREDS)) {
     fs.copyFileSync(OAUTH_CREDS, path.join(dir, "oauth_creds.json"));
+  } else {
+    try {
+      const text = Buffer.from(cred.blobB64, "base64").toString("utf8");
+      fs.writeFileSync(path.join(dir, "oauth_creds.json"), text, "utf8");
+    } catch { /* ignore */ }
   }
   if (fs.existsSync(GOOGLE_ACCOUNTS)) {
     fs.copyFileSync(GOOGLE_ACCOUNTS, path.join(dir, "google_accounts.json"));
+  } else if (email) {
+    writeJson(path.join(dir, "google_accounts.json"), { active: email, old: [] });
   }
   if (fs.existsSync(AGY_OAUTH_FILE)) {
     fs.copyFileSync(AGY_OAUTH_FILE, path.join(dir, "antigravity-oauth-token"));
@@ -271,7 +339,25 @@ export function switchAccount(name) {
 export function removeAccount(name) {
   const dir = profileDir(name);
   if (!fs.existsSync(dir)) throw new Error(`account not found: ${name}`);
-  fs.rmSync(dir, { recursive: true, force: true });
+  let lastErr = null;
+  for (let i = 0; i < 6; i++) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 150 });
+      lastErr = null;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const until = Date.now() + 300;
+      while (Date.now() < until) {
+        /* brief wait for Chrome/AV lock release */
+      }
+    }
+  }
+  if (lastErr || fs.existsSync(dir)) {
+    throw new Error(
+      `无法删除「${name}」：${lastErr?.message || "目录仍被占用"}。若刚跑过授权，请先关掉弹出的 Chrome 再删。`
+    );
+  }
   const active = getActive();
   if (active === name) {
     if (fs.existsSync(ACTIVE_PATH)) fs.unlinkSync(ACTIVE_PATH);
@@ -295,16 +381,147 @@ export function clearLiveAuth() {
   return { cleared: true };
 }
 
+function resolveAgyBinaryLocal() {
+  if (process.env.AGY_BIN && existsSync(process.env.AGY_BIN)) return process.env.AGY_BIN;
+  const local = path.join(
+    process.env.LOCALAPPDATA || "",
+    "agy",
+    "bin",
+    process.platform === "win32" ? "agy.exe" : "agy"
+  );
+  if (existsSync(local)) return local;
+  return process.platform === "win32" ? "agy.exe" : "agy";
+}
+
+/**
+ * Open interactive `agy` in a new console so the browser OAuth flow can run.
+ * Chrome will show already-signed-in Google accounts for one-click pick
+ * (we cannot read Chrome cookies into Antigravity OAuth).
+ */
+export function startCliLogin() {
+  // Keep interactive session auto-approved (same intent as headless wrapper)
+  try {
+    const settings = readJson(AGY_SETTINGS, {});
+    writeJson(AGY_SETTINGS, {
+      ...settings,
+      toolPermission: "always-proceed",
+      artifactReviewPolicy: "always-proceed",
+      allowNonWorkspaceAccess: true,
+    });
+  } catch { /* ignore */ }
+
+  const bin = resolveAgyBinaryLocal();
+  if (process.platform === "win32") {
+    const ps = `
+$bin = ${JSON.stringify(bin)}
+if (-not (Test-Path -LiteralPath $bin)) { throw "agy not found: $bin" }
+# Interactive login window with auto-approve so permission prompts don't block
+Start-Process -FilePath $bin -ArgumentList @('--dangerously-skip-permissions') -WorkingDirectory $env:USERPROFILE
+`;
+    const r = spawnSync(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+      { encoding: "utf8", windowsHide: true }
+    );
+    if (r.status !== 0) {
+      throw new Error((r.stderr || r.stdout || "failed to launch agy").trim());
+    }
+  } else {
+    const child = spawn(bin, ["--dangerously-skip-permissions"], {
+      detached: true,
+      stdio: "ignore",
+      cwd: os.homedir(),
+      env: process.env,
+    });
+    child.unref();
+  }
+  return {
+    started: true,
+    binary: bin,
+    autoApprove: true,
+    hint: "在弹出的 CLI / 浏览器里用 Google 登录；Chrome 已登录的账号可直接点选。工具同意已默认 always-proceed。完成后前端会自动检测并保存。",
+  };
+}
+
+/**
+ * One-click path for adding another Google account:
+ * 1) optionally snapshot current live login if not already saved
+ * 2) clear live auth
+ * 3) launch interactive agy login
+ */
+export function beginAddAccount({ saveCurrentAs, skipSaveCurrent = false } = {}) {
+  const before = whoami();
+  let savedCurrent = null;
+
+  if (!skipSaveCurrent && before.wincredExists) {
+    const email = before.email;
+    const profiles = listProfiles();
+    const already = email
+      ? profiles.some((p) => p.email && p.email.toLowerCase() === String(email).toLowerCase())
+      : Boolean(before.activeProfile && profiles.some((p) => p.name === before.activeProfile));
+    if (!already || saveCurrentAs) {
+      const name =
+        (saveCurrentAs && String(saveCurrentAs).trim()) ||
+        (email ? String(email).split("@")[0].replace(/[^\w.+-]+/g, "_") : null) ||
+        before.activeProfile ||
+        "default";
+      try {
+        savedCurrent = saveAccount(name);
+      } catch (err) {
+        // still proceed with login; surface warning
+        savedCurrent = { error: err.message, attemptedName: name };
+      }
+    } else {
+      savedCurrent = { skipped: true, reason: "already_saved", email };
+    }
+  }
+
+  clearLiveAuth();
+  const login = startCliLogin();
+  return {
+    ok: true,
+    savedCurrent,
+    login,
+    beforeEmail: before.email || null,
+    next: "完成浏览器登录后调用 POST /v1/accounts/save 保存新号",
+  };
+}
+
+/** Suggest a profile name from live email. */
+export function suggestProfileName() {
+  const email = currentEmail();
+  if (!email) return null;
+  const base = email.split("@")[0].replace(/[^\w.+-]+/g, "_") || "account";
+  const taken = new Set(listProfiles().map((p) => p.name.toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base;
+  for (let i = 2; i < 50; i++) {
+    const n = `${base}${i}`;
+    if (!taken.has(n.toLowerCase())) return n;
+  }
+  return `${base}_${Date.now().toString(36)}`;
+}
+
 export function whoami() {
+  // Refresh sidecar files from WinCred when present (CLI-only login)
+  try {
+    if (runWinCred("exists")?.exists) syncLiveOAuthFilesFromWinCred();
+  } catch { /* ignore */ }
+
   const active = getActive();
   const email = currentEmail();
   const cred = runWinCred("exists");
   const runtime = readJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {});
+  const profiles = listProfiles();
+  const alreadySaved = email
+    ? profiles.some((p) => p.email && p.email.toLowerCase() === email.toLowerCase())
+    : false;
   return {
     activeProfile: active,
     email,
     wincredExists: Boolean(cred.exists),
-    accountType: runtime.AGY_ACCOUNT_TYPE || (active ? listProfiles().find((p) => p.name === active)?.type : null),
+    accountType: runtime.AGY_ACCOUNT_TYPE || (active ? profiles.find((p) => p.name === active)?.type : null),
+    suggestedName: email ? suggestProfileName() : null,
+    alreadySaved,
   };
 }
 
@@ -328,6 +545,10 @@ export const accountsApi = {
   switchAccount,
   removeAccount,
   clearLiveAuth,
+  startCliLogin,
+  beginAddAccount,
+  suggestProfileName,
+  syncLiveOAuthFilesFromWinCred,
   listProfiles,
   whoami,
   getActive,

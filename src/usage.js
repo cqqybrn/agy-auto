@@ -147,11 +147,13 @@ function extractOauthClientFromBinary(exePath) {
     const ids = [...text.matchAll(/[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com/g)].map(
       (m) => m[0]
     );
-    const secrets = [...text.matchAll(/GOCSPX-[A-Za-z0-9_-]+/g)].map((m) => m[0]);
+    const secrets = [...text.matchAll(/GOCSPX-[A-Za-z0-9_-]{28}/g)].map((m) => m[0]);
     if (!ids.length || !secrets.length) return null;
     const clientId =
       ids.find((id) => id.startsWith(PREFERRED_CLIENT_ID_PREFIX)) || ids[0];
-    return { client_id: clientId, client_secret: secrets[0] };
+    const unique = [...new Set(secrets)].filter((s) => s.length === 35 && !s.includes("http"));
+    if (!unique.length) return null;
+    return { client_id: clientId, client_secret: unique[0] };
   } catch {
     return null;
   }

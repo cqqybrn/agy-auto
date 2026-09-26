@@ -2,6 +2,7 @@
 import http from "node:http";
 import { URL } from "node:url";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -13,6 +14,7 @@ import {
   listActiveRuns,
   listAgents,
   readTranscript,
+  deleteConversationArtifacts,
 } from "./agyRunner.js";
 import {
   listProfiles,
@@ -20,15 +22,20 @@ import {
   switchAccount,
   removeAccount,
   clearLiveAuth,
+  beginAddAccount,
+  startCliLogin,
   whoami,
 } from "./accounts.js";
+import { startBrowserOAuth, finishBrowserOAuth, getOAuthHint, getOAuthStatus } from "./oauthLogin.js";
 import {
   getPrefs,
   listModels,
   resolveDefaultModel,
+  resolveDefaultAgent,
   setPrefs,
 } from "./models.js";
 import { getUsage, recordLocalUsage } from "./usage.js";
+import { ensureBundledAgents, DEFAULT_AGENT_ID } from "./ensureAgent.js";
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -45,6 +52,55 @@ const MIME = {
   ".ico": "image/x-icon",
   ".woff2": "font/woff2",
 };
+
+const UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
+const UPLOAD_ALLOWED_EXT = new Set([
+  ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",
+  ".md", ".markdown", ".txt", ".log", ".csv", ".json", ".xml", ".html", ".htm",
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".rtf", ".yaml", ".yml",
+]);
+
+function safeUploadName(name) {
+  const base = path.basename(String(name || "file")).replace(/[^\w.\u4e00-\u9fff()\-+\[\]]+/g, "_");
+  return (base || "file").slice(0, 120);
+}
+
+function saveUpload({ filename, contentBase64, cwd, mime } = {}) {
+  if (!contentBase64 || typeof contentBase64 !== "string") {
+    return { ok: false, error: "content_base64 required" };
+  }
+  const raw = contentBase64.replace(/^data:[^;]+;base64,/, "");
+  let buf;
+  try {
+    buf = Buffer.from(raw, "base64");
+  } catch {
+    return { ok: false, error: "invalid base64" };
+  }
+  if (!buf.length) return { ok: false, error: "empty file" };
+  if (buf.length > UPLOAD_MAX_BYTES) return { ok: false, error: `file too large (max ${UPLOAD_MAX_BYTES} bytes)` };
+
+  const safe = safeUploadName(filename);
+  const ext = path.extname(safe).toLowerCase();
+  if (!UPLOAD_ALLOWED_EXT.has(ext)) {
+    return { ok: false, error: `unsupported file type: ${ext || "(none)"}` };
+  }
+
+  const root = path.resolve(cwd || DEFAULT_CWD);
+  const dir = path.join(root, ".agy-uploads");
+  fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const outName = `${stamp}_${safe}`;
+  const outPath = path.join(dir, outName);
+  fs.writeFileSync(outPath, buf);
+  return {
+    ok: true,
+    path: outPath,
+    name: safe,
+    size: buf.length,
+    mime: mime || null,
+    ext,
+  };
+}
 
 function tryServeStatic(req, res, pathname) {
   if (req.method !== "GET") return false;
@@ -105,6 +161,87 @@ function bad(msg) {
   return Object.assign(new Error(msg), { code: "BAD_REQUEST" });
 }
 
+function listWindowsDrives() {
+  const drives = [];
+  for (let i = 65; i <= 90; i++) {
+    const letter = String.fromCharCode(i);
+    const root = `${letter}:\\`;
+    try {
+      if (fs.existsSync(root)) drives.push({ name: `${letter}:`, path: root, isDir: true });
+    } catch {
+      /* skip inaccessible */
+    }
+  }
+  return drives;
+}
+
+/** Local folder browser for picking project cwd (Cursor / Antigravity style). */
+function listFsDir(dir) {
+  const home = os.homedir();
+  const roots =
+    process.platform === "win32"
+      ? listWindowsDrives()
+      : [{ name: "/", path: "/", isDir: true }];
+
+  const raw = dir == null ? "" : String(dir).trim();
+  if (!raw || raw === ":roots") {
+    return { path: null, parent: null, home, roots, entries: roots, atRoots: true };
+  }
+
+  let resolved;
+  try {
+    resolved = path.resolve(raw);
+  } catch {
+    throw Object.assign(new Error("invalid path"), { code: "BAD_PATH", status: 400 });
+  }
+  if (!fs.existsSync(resolved)) {
+    throw Object.assign(new Error("path not found"), { code: "NOT_FOUND", status: 404 });
+  }
+  let st;
+  try {
+    st = fs.statSync(resolved);
+  } catch (err) {
+    throw Object.assign(new Error(err.message || "cannot stat"), { code: "READ_DENIED", status: 403 });
+  }
+  if (!st.isDirectory()) {
+    throw Object.assign(new Error("not a directory"), { code: "NOT_DIR", status: 400 });
+  }
+
+  let entries = [];
+  try {
+    entries = fs
+      .readdirSync(resolved, { withFileTypes: true })
+      .filter((e) => {
+        try {
+          return e.isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .map((e) => ({
+        name: e.name,
+        path: path.join(resolved, e.name),
+        isDir: true,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
+  } catch (err) {
+    throw Object.assign(new Error(err.message || "cannot read directory"), {
+      code: "READ_DENIED",
+      status: 403,
+    });
+  }
+
+  const parent = path.dirname(resolved);
+  return {
+    path: resolved,
+    parent: parent !== resolved ? parent : null,
+    home,
+    roots,
+    entries,
+    atRoots: false,
+  };
+}
+
 function openaiChatResponse({ id, model, content, usage }) {
   return {
     id: id || `chatcmpl-agy-${Date.now()}`,
@@ -153,11 +290,12 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 200, {
       ok: true,
       service: "agy-auto-backend",
-      version: "1.3.0",
+      version: "1.4.0",
       capabilities: {
         autoApprove: true,
         streaming: true,
         subagents: true,
+        parallelAgent: true,
         transcripts: true,
         thinking: {
           main_stream: false,
@@ -171,6 +309,8 @@ const server = http.createServer(async (req, res) => {
       agy: resolveAgyBinary(),
       autoApprove: true,
       flag: "--dangerously-skip-permissions",
+      mode: process.env.AGY_MODE || "accept-edits",
+      defaultAgent: resolveDefaultAgent(getPrefs().defaultAgent),
       cwd: DEFAULT_CWD,
       prefs: getPrefs(),
       account,
@@ -186,6 +326,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         object: "list",
         default_model: prefs.defaultModel,
+        default_agent: resolveDefaultAgent(prefs.defaultAgent),
         data,
       });
     } catch (err) {
@@ -217,6 +358,7 @@ const server = http.createServer(async (req, res) => {
         defaultModel: body.defaultModel ?? body.default_model ?? undefined,
         defaultEffort: body.defaultEffort ?? body.default_effort ?? undefined,
         defaultCwd: body.defaultCwd ?? body.default_cwd ?? undefined,
+        defaultAgent: body.defaultAgent ?? body.default_agent ?? undefined,
       });
       return sendJson(res, 200, { ok: true, prefs });
     }
@@ -246,6 +388,61 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...r });
     }
 
+    // One-click browser OAuth (preferred): open Google → paste code in WebUI
+    if (req.method === "POST" && url.pathname === "/v1/accounts/oauth/start") {
+      const body = await readBody(req).catch(() => ({}));
+      const r = startBrowserOAuth({
+        saveCurrentAs: body.saveCurrentAs || body.save_current_as,
+        skipSaveCurrent: Boolean(body.skipSaveCurrent || body.skip_save_current),
+        open: body.open !== false,
+        auto: body.auto !== false,
+      });
+      return sendJson(res, 200, r);
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/accounts/oauth/finish") {
+      const body = await readBody(req);
+      const r = await finishBrowserOAuth({
+        state: body.state,
+        code: body.code,
+        name: body.name,
+      });
+      return sendJson(res, 200, r);
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/accounts/oauth/hint") {
+      return sendJson(res, 200, getOAuthHint());
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/accounts/oauth/status") {
+      const state = url.searchParams.get("state") || "";
+      return sendJson(res, 200, getOAuthStatus(state));
+    }
+
+    // Legacy: snapshot current → clear → open interactive agy (may require paste into CLI)
+    if (req.method === "POST" && url.pathname === "/v1/accounts/add") {
+      const body = await readBody(req).catch(() => ({}));
+      // Prefer browser OAuth unless client asks for CLI
+      if (body.cli === true || body.mode === "cli") {
+        const r = beginAddAccount({
+          saveCurrentAs: body.saveCurrentAs || body.save_current_as,
+          skipSaveCurrent: Boolean(body.skipSaveCurrent || body.skip_save_current),
+        });
+        return sendJson(res, 200, r);
+      }
+      const r = startBrowserOAuth({
+        saveCurrentAs: body.saveCurrentAs || body.save_current_as,
+        skipSaveCurrent: Boolean(body.skipSaveCurrent || body.skip_save_current),
+        open: body.open !== false,
+      });
+      return sendJson(res, 200, { ...r, mode: "browser" });
+    }
+
+    // Re-open CLI login without clearing (if user closed the window)
+    if (req.method === "POST" && url.pathname === "/v1/accounts/login") {
+      return sendJson(res, 200, { ok: true, ...startCliLogin() });
+    }
+
     if (req.method === "POST" && url.pathname === "/v1/accounts/switch") {
       const body = await readBody(req);
       if (!body.name) throw bad("name required");
@@ -260,6 +457,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "DELETE" && url.pathname.startsWith("/v1/accounts/")) {
       const name = decodeURIComponent(url.pathname.slice("/v1/accounts/".length));
       if (!name) throw bad("name required");
+      if (name.includes("/") || name === "oauth" || name.startsWith("oauth")) {
+        // avoid clashing with /v1/accounts/oauth/* ; also block junk names
+        if (name.includes("/")) throw bad("invalid account name");
+      }
       return sendJson(res, 200, { ok: true, ...removeAccount(name) });
     }
 
@@ -290,10 +491,51 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, data.ok ? 200 : 404, data);
     }
 
+    // Purge brain/ + conversations/*.db residuals (and discovered subagent ids)
+    if (req.method === "POST" && url.pathname === "/v1/conversations/purge") {
+      const body = await readBody(req);
+      const ids = body.conversation_ids || body.ids || body.conversation_id || body.conversationId;
+      const list = Array.isArray(ids) ? ids : ids ? [ids] : [];
+      if (!list.length) throw bad("conversation_ids required");
+      return sendJson(res, 200, deleteConversationArtifacts(list));
+    }
+
+    if (req.method === "DELETE" && url.pathname.startsWith("/v1/conversations/")) {
+      const id = decodeURIComponent(url.pathname.slice("/v1/conversations/".length));
+      if (!id) throw bad("conversation id required");
+      return sendJson(res, 200, deleteConversationArtifacts([id]));
+    }
+
+    // Browse local folders (for project picker)
+    if (req.method === "GET" && url.pathname === "/v1/fs/list") {
+      const dir = url.searchParams.get("path") || url.searchParams.get("dir") || "";
+      try {
+        return sendJson(res, 200, listFsDir(dir));
+      } catch (err) {
+        const status = err.status || 500;
+        return sendJson(res, status, { error: { message: err.message, code: err.code || "FS_ERROR" } });
+      }
+    }
+
+    // Upload attachments for chat (saved under cwd/.agy-uploads/)
+    if (req.method === "POST" && url.pathname === "/v1/uploads") {
+      const body = await readBody(req);
+      const prefs = getPrefs();
+      const cwd = body.cwd || prefs.defaultCwd || DEFAULT_CWD;
+      const result = saveUpload({
+        filename: body.filename || body.name,
+        contentBase64: body.content_base64 || body.contentBase64 || body.data,
+        cwd,
+        mime: body.mime || body.content_type,
+      });
+      if (!result.ok) throw Object.assign(new Error(result.error || "upload failed"), { code: "BAD_REQUEST" });
+      return sendJson(res, 200, result);
+    }
+
     if (req.method === "GET" && url.pathname === "/v1/capabilities") {
       return sendJson(res, 200, {
         service: "agy-auto-backend",
-        version: "1.3.0",
+        version: "1.4.0",
         official_parity: {
           model_quotas_panel: true,
           model_selector: true,
@@ -302,6 +544,7 @@ const server = http.createServer(async (req, res) => {
           streaming_steps: true,
           subagent_events: true,
           subagent_thinking_via_transcript: true,
+          parallel_agent_default: "agy-fast (batch tools + invoke_subagent)",
           main_agent_thinking_stream: false,
           ai_credits_balance: false,
           interactive_agents_panel_kill: "partial (abort whole run only)",
@@ -312,7 +555,8 @@ const server = http.createServer(async (req, res) => {
           "GET|PUT /v1/prefs",
           "GET /v1/usage",
           "GET /v1/accounts",
-          "POST /v1/accounts/save|switch|clear-live",
+          "POST /v1/accounts/save|switch|clear-live|add|login|oauth/start|oauth/finish",
+          "GET /v1/accounts/oauth/hint|status",
           "DELETE /v1/accounts/:name",
           "GET /v1/agents",
           "GET /v1/runs",
@@ -320,6 +564,10 @@ const server = http.createServer(async (req, res) => {
           "POST /v1/agent/stream",
           "POST /v1/agent/abort",
           "GET /v1/transcripts/:id",
+          "POST /v1/conversations/purge",
+          "DELETE /v1/conversations/:id",
+          "POST /v1/uploads",
+          "GET /v1/fs/list",
           "POST /v1/chat/completions",
           "GET /v1/capabilities",
         ],
@@ -333,17 +581,19 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) throw bad("prompt required");
       const model = resolveDefaultModel(body.model);
       const prefs = getPrefs();
+      const agent = resolveDefaultAgent(body.agent);
       const result = await runAgy({
         prompt,
         cwd: body.cwd || prefs.defaultCwd || DEFAULT_CWD,
         model,
         effort: body.effort || prefs.defaultEffort,
-        agent: body.agent,
+        agent,
         conversationId: body.conversation_id || body.conversationId,
         continueLast: Boolean(body.continue),
         outputFormat: body.output_format || "json",
         printTimeout: body.print_timeout,
         timeoutMs: body.timeout_ms,
+        mode: body.mode,
         extraArgs: body.extra_args,
       });
       try {
@@ -382,6 +632,7 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) throw bad("prompt required");
       const model = resolveDefaultModel(body.model);
       const prefs = getPrefs();
+      const agent = resolveDefaultAgent(body.agent);
       const runId =
         body.run_id ||
         `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -415,11 +666,12 @@ const server = http.createServer(async (req, res) => {
             cwd: body.cwd || prefs.defaultCwd || DEFAULT_CWD,
             model,
             effort: body.effort || prefs.defaultEffort,
-            agent: body.agent,
+            agent,
             conversationId: body.conversation_id || body.conversationId,
             continueLast: Boolean(body.continue),
             printTimeout: body.print_timeout,
             timeoutMs: body.timeout_ms,
+            mode: body.mode,
             extraArgs: body.extra_args,
           },
           (evt) => {
@@ -490,17 +742,19 @@ const server = http.createServer(async (req, res) => {
       if (!prompt) throw bad("messages or prompt required");
       const model = resolveDefaultModel(body.model);
       const prefs = getPrefs();
+      const agent = resolveDefaultAgent(body.agent || body.metadata?.agent);
       const result = await runAgy({
         prompt,
         cwd: body.cwd || body.metadata?.cwd || prefs.defaultCwd || DEFAULT_CWD,
         model,
         effort: body.effort || body.metadata?.effort || prefs.defaultEffort,
-        agent: body.agent || body.metadata?.agent,
+        agent,
         conversationId: body.conversation_id || body.metadata?.conversation_id,
         continueLast: Boolean(body.continue || body.metadata?.continue),
         outputFormat: "json",
         printTimeout: body.print_timeout,
         timeoutMs: body.timeout_ms,
+        mode: body.mode || body.metadata?.mode,
       });
       try {
         recordLocalUsage({
@@ -544,9 +798,19 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
+  try {
+    const installed = ensureBundledAgents();
+    console.log(
+      `[agy-auto] agent ${DEFAULT_AGENT_ID}: ${installed.path}${installed.updated ? " (updated)" : ""}`
+    );
+  } catch (err) {
+    console.warn(`[agy-auto] failed to install bundled agent: ${err.message}`);
+  }
   console.log(`[agy-auto] listening on http://${HOST}:${PORT}`);
   console.log(`[agy-auto] agy binary: ${resolveAgyBinary()}`);
   console.log(`[agy-auto] auto-approve: --dangerously-skip-permissions`);
+  console.log(`[agy-auto] mode: ${process.env.AGY_MODE || "accept-edits"}`);
+  console.log(`[agy-auto] default agent: ${resolveDefaultAgent(getPrefs().defaultAgent)}`);
   console.log(`[agy-auto] default cwd: ${DEFAULT_CWD}`);
   try {
     console.log(`[agy-auto] account: ${JSON.stringify(whoami())}`);

@@ -35,6 +35,7 @@ export function buildAgyArgs({
   continueLast = false,
   outputFormat = "json",
   printTimeout,
+  mode,
   extraArgs = [],
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
@@ -48,6 +49,12 @@ export function buildAgyArgs({
     "--output-format",
     outputFormat,
   ];
+
+  // accept-edits matches IDE “just do the edits” flow; still needs skip-permissions in print mode
+  const execMode = mode || process.env.AGY_MODE || "accept-edits";
+  if (execMode && execMode !== "off") {
+    args.push("--mode", String(execMode));
+  }
 
   if (model) args.push("--model", String(model));
   if (effort) args.push("--effort", String(effort));
@@ -465,18 +472,32 @@ export function abortRun(runId) {
   const entry = activeRuns.get(runId);
   if (!entry) return { ok: false, error: "run not found" };
   entry.abortReason = "client";
+  const pid = entry.child?.pid;
   try {
     entry.child.kill("SIGTERM");
   } catch (err) {
-    return { ok: false, error: err.message };
+    // fall through to tree kill on Windows
+    if (process.platform !== "win32") return { ok: false, error: err.message };
   }
-  setTimeout(() => {
+  // Windows: SIGTERM often leaves agy child processes alive — kill the tree
+  if (process.platform === "win32" && pid) {
     try {
-      entry.child.kill("SIGKILL");
+      spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
     } catch {
       /* ignore */
     }
-  }, 2000);
+  } else {
+    setTimeout(() => {
+      try {
+        entry.child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+    }, 2000);
+  }
   return { ok: true, run_id: runId };
 }
 
@@ -602,6 +623,104 @@ export async function readTranscript(idOrUri, { limit = 500, includeThinking = t
   };
 }
 
+const CONV_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isConversationId(id) {
+  return CONV_ID_RE.test(String(id || ""));
+}
+
+function geminiRoots() {
+  const home = os.homedir();
+  return [
+    path.join(home, ".gemini", "antigravity-cli"),
+    path.join(home, ".gemini", "antigravity"),
+  ];
+}
+
+/** Collect related conversation UUIDs (e.g. subagents) referenced in a transcript. */
+function relatedIdsFromTranscript(primaryId) {
+  const related = new Set();
+  const filePath = resolveTranscriptPath(primaryId);
+  if (!filePath || !existsSync(filePath)) return related;
+  let text = "";
+  try {
+    text = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return related;
+  }
+  const re = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+  for (const m of text.matchAll(re)) {
+    const id = m[0];
+    if (id.toLowerCase() !== String(primaryId).toLowerCase()) related.add(id);
+  }
+  return related;
+}
+
+function removePath(target) {
+  if (!existsSync(target)) return false;
+  const st = fs.statSync(target);
+  if (st.isDirectory()) fs.rmSync(target, { recursive: true, force: true });
+  else fs.unlinkSync(target);
+  return true;
+}
+
+/** Delete brain/ + conversations/*.db* artifacts for one conversation id. */
+function deleteOneConversationArtifacts(id) {
+  const removed = [];
+  const missing = [];
+  for (const root of geminiRoots()) {
+    const brain = path.join(root, "brain", id);
+    if (removePath(brain)) removed.push(brain);
+    else missing.push(brain);
+
+    const convDir = path.join(root, "conversations");
+    for (const name of [`${id}.db`, `${id}.db-shm`, `${id}.db-wal`]) {
+      const f = path.join(convDir, name);
+      if (removePath(f)) removed.push(f);
+    }
+  }
+  return { id, removed, missing };
+}
+
+/**
+ * Stop is caller's job. This purges on-disk Antigravity residuals for the
+ * given conversation id(s), including subagent ids discovered in transcripts.
+ */
+export function deleteConversationArtifacts(ids = []) {
+  const input = [...new Set((Array.isArray(ids) ? ids : [ids]).map(String).filter(Boolean))];
+  const queue = [];
+  const errors = [];
+  for (const id of input) {
+    if (!isConversationId(id)) {
+      errors.push({ id, error: "invalid conversation id" });
+      continue;
+    }
+    queue.push(id);
+    for (const rel of relatedIdsFromTranscript(id)) {
+      if (isConversationId(rel)) queue.push(rel);
+    }
+  }
+  const seen = new Set();
+  const results = [];
+  for (const id of queue) {
+    const key = id.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      results.push(deleteOneConversationArtifacts(id));
+    } catch (err) {
+      errors.push({ id, error: err.message || String(err) });
+    }
+  }
+  return {
+    ok: errors.length === 0,
+    purged: results,
+    errors,
+    count: results.reduce((n, r) => n + r.removed.length, 0),
+  };
+}
+
 function readAgentMd(dir) {
   const md = path.join(dir, "agent.md");
   if (!existsSync(md)) return null;
@@ -628,7 +747,7 @@ export function listAgents(cwd = process.cwd()) {
     {
       id: "default",
       name: "Default agent",
-      description: "Built-in Antigravity default agent",
+      description: "Built-in Antigravity default — often serial tool use",
       scope: "builtin",
     },
   ];
@@ -647,5 +766,9 @@ export function listAgents(cwd = process.cwd()) {
       if (a) agents.push({ ...a, scope });
     }
   }
+  agents.sort((a, b) => {
+    const score = (x) => (x.id === "agy-fast" ? 0 : x.id === "default" ? 2 : 1);
+    return score(a) - score(b) || String(a.name).localeCompare(String(b.name));
+  });
   return agents;
 }

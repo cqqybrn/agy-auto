@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta name="color-scheme" content="dark light" />
 <title>Antigravity Console</title>
-<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="styles.css?v=20260927w" />
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' x2='1'><stop offset='0' stop-color='%234f8ff7'/><stop offset='.5' stop-color='%23a178f2'/><stop offset='1' stop-color='%23f28b60'/></linearGradient></defs><path d='M6 27C6 13 10.5 5 16 5s10 8 10 22' fill='none' stroke='url(%23g)' stroke-width='5.5' stroke-linecap='round'/></svg>" />
 <script>
 (() => {
@@ -52,8 +52,8 @@
       <button class="icon-btn sm" id="btnCollapse" title="收起侧栏"><i data-i="panel"></i></button>
     </div>
 
-    <button class="new-chat" id="btnNewChat">
-      <i data-i="plus"></i><span>New conversation</span><kbd>Ctrl K</kbd>
+    <button class="new-chat" id="btnNewChat" title="浏览本机文件夹并新建会话">
+      <i data-i="plus"></i><span>New conversation</span>
     </button>
 
     <label class="side-search">
@@ -64,9 +64,12 @@
     <nav id="convList" class="conv-list"></nav>
 
     <div class="side-foot">
-      <button class="runs-pill hidden" id="runsPill" title="进行中的任务">
-        <span class="spin"></span><span id="runsCount">0</span> running
-      </button>
+      <div class="runs-wrap">
+        <button class="runs-pill hidden" id="runsPill" title="进行中的任务">
+          <span class="spin"></span><span id="runsCount">0</span> running
+        </button>
+        <div class="runs-pop hidden" id="runsPop"></div>
+      </div>
       <div class="conn" id="connBox" title="后端连接">
         <span class="conn-dot" id="connDot"></span>
         <div class="conn-info">
@@ -88,8 +91,8 @@
         <span class="conv-id hidden" id="convIdChip" title="点击复制 conversation_id"></span>
       </div>
       <div class="top-right">
-        <button class="qmeter" id="quotaBtn" title="Model Quotas">
-          <span class="qm-empty">Quotas</span>
+        <button class="qmeter" id="quotaBtn" title="Model Quotas — Gemini / Claude·GPT · Weekly &amp; 5h">
+          <span class="qm-empty">加载额度…</span>
         </button>
         <button class="account-chip" id="accountChip" title="账号管理">
           <span class="avatar" id="avatarLetter">?</span>
@@ -105,27 +108,22 @@
 
     <footer id="composerWrap">
       <div class="composer" id="composer">
-        <textarea id="promptInput" rows="1" placeholder="Ask anything, or describe a task for the agent…" spellcheck="false"></textarea>
+        <div class="drop-hint" id="dropHint" aria-hidden="true">
+          <i data-i="paperclip"></i>
+          <span>放下文件以附加（图片 / Markdown / 文档等）</span>
+        </div>
+        <div class="attach-list hidden" id="attachList"></div>
+        <textarea id="promptInput" rows="1" placeholder="" spellcheck="false"></textarea>
         <div class="composer-bar">
           <div class="cb-left">
+            <button class="chip" id="attachBtn" type="button" title="添加文件（也可拖拽到输入框）"><i data-i="paperclip"></i><span>附件</span></button>
+            <input type="file" id="attachInput" class="sr-only" multiple accept=".jpg,.jpeg,.png,.gif,.webp,.bmp,.svg,.md,.markdown,.txt,.pdf,.doc,.docx,.xls,.xlsx,.csv,.json,.xml,.html,.htm,.rtf,.log,.yaml,.yml" />
             <div class="pop-anchor">
               <button class="chip" id="cwdChip" title="工作目录"><i data-i="folder"></i><span id="cwdLabel">Workspace</span></button>
               <div class="popover hidden" id="cwdPop"></div>
             </div>
-            <div class="pop-anchor">
-              <button class="chip" id="agentChip" title="Agent"><i data-i="layers"></i><span id="agentLabel">Default agent</span></button>
-              <div class="popover hidden" id="agentPop"></div>
-            </div>
-            <div class="pop-anchor">
-              <button class="chip icon-only" id="advChip" title="高级选项"><i data-i="sliders"></i></button>
-              <div class="popover hidden" id="advPop"></div>
-            </div>
           </div>
           <div class="cb-right">
-            <div class="pop-anchor">
-              <button class="chip" id="effortChip" title="Reasoning effort"><i data-i="zap"></i><span id="effortLabel">Auto</span></button>
-              <div class="popover right hidden" id="effortPop"></div>
-            </div>
             <div class="pop-anchor">
               <button class="chip model" id="modelChip" title="模型"><span class="model-dot" id="modelDot"></span><span id="modelLabel">Loading…</span><i data-i="chevDown" class="chev"></i></button>
               <div class="popover right wide hidden" id="modelPop"></div>
@@ -133,9 +131,6 @@
             <button id="sendBtn" class="send-btn" title="发送 (Enter)"><i data-i="arrowUp"></i></button>
           </div>
         </div>
-      </div>
-      <div class="composer-hint" id="composerHint">
-        <span class="auto-dot"></span>Auto-approve on · 所有写文件 / 跑命令将自动执行
       </div>
     </footer>
   </main>
@@ -163,7 +158,7 @@
   <div class="drawer-head">
     <div>
       <h2>Accounts</h2>
-      <p class="drawer-desc">切换免浏览器登录（写入 Windows 凭据管理器）</p>
+      <p class="drawer-desc" id="accountDesc"></p>
     </div>
     <div class="drawer-actions">
       <button class="icon-btn" id="accountRefresh" title="刷新"><i data-i="refresh"></i></button>
@@ -177,7 +172,7 @@
   <div class="drawer-head">
     <div>
       <h2>Settings</h2>
-      <p class="drawer-desc">连接、默认偏好、运行中的任务与能力说明</p>
+      <p class="drawer-desc"></p>
     </div>
     <div class="drawer-actions">
       <button class="icon-btn" data-close title="关闭"><i data-i="x"></i></button>
@@ -199,6 +194,6 @@
 
 <div id="toastWrap"></div>
 
-<script src="app.js"></script>
+<script src="app.js?v=20260927w"></script>
 </body>
 </html>
