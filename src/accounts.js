@@ -1,0 +1,337 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const ACCOUNTS_DIR = path.join(ROOT, "accounts");
+const ACTIVE_PATH = path.join(ACCOUNTS_DIR, "active.json");
+const WINCRED_PS1 = path.join(ROOT, "scripts", "wincred.ps1");
+
+const GEMINI_DIR = path.join(os.homedir(), ".gemini");
+const OAUTH_CREDS = path.join(GEMINI_DIR, "oauth_creds.json");
+const GOOGLE_ACCOUNTS = path.join(GEMINI_DIR, "google_accounts.json");
+const AGY_SETTINGS = path.join(GEMINI_DIR, "antigravity-cli", "settings.json");
+const AGY_OAUTH_FILE = path.join(
+  GEMINI_DIR,
+  "antigravity-cli",
+  "antigravity-oauth-token"
+);
+
+function ensureDir(p) {
+  fs.mkdirSync(p, { recursive: true });
+}
+
+function readJson(p, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(p, obj) {
+  ensureDir(path.dirname(p));
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
+}
+
+function runWinCred(action, extra = {}) {
+  const args = [
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    WINCRED_PS1,
+    "-Action",
+    action,
+  ];
+  if (extra.blobB64) {
+    args.push("-BlobBase64", extra.blobB64);
+  }
+  if (extra.username) {
+    args.push("-UserName", extra.username);
+  }
+  const r = spawnSync("powershell.exe", args, {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  if (r.error) throw r.error;
+  const out = (r.stdout || "").trim();
+  const err = (r.stderr || "").trim();
+  if (r.status !== 0) {
+    throw new Error(`wincred ${action} failed: ${err || out || `exit ${r.status}`}`);
+  }
+  if (!out) throw new Error(`wincred ${action} returned empty output`);
+  // PowerShell may emit BOM / warnings; take last JSON line
+  const lines = out.split(/\r?\n/).filter((l) => l.trim().startsWith("{"));
+  const jsonLine = lines[lines.length - 1] || out;
+  return JSON.parse(jsonLine);
+}
+
+function decodeJwtEmail(idToken) {
+  if (!idToken || typeof idToken !== "string") return null;
+  const parts = idToken.split(".");
+  if (parts.length < 2) return null;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(parts[1].replace(/-/g, "+").replace(/_/g, "/"), "base64").toString(
+        "utf8"
+      )
+    );
+    return payload.email || payload.preferred_username || null;
+  } catch {
+    return null;
+  }
+}
+
+function currentEmail() {
+  const ga = readJson(GOOGLE_ACCOUNTS, {});
+  if (ga?.active) return ga.active;
+  const oauth = readJson(OAUTH_CREDS, {});
+  return decodeJwtEmail(oauth?.id_token);
+}
+
+function profileDir(name) {
+  const safe = String(name).trim().replace(/[^\w.@+-]+/g, "_");
+  if (!safe) throw new Error("invalid account name");
+  return path.join(ACCOUNTS_DIR, safe);
+}
+
+export function listProfiles() {
+  ensureDir(ACCOUNTS_DIR);
+  const active = readJson(ACTIVE_PATH, {})?.name || null;
+  const names = fs
+    .readdirSync(ACCOUNTS_DIR, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name)
+    .sort();
+  return names.map((name) => {
+    const meta = readJson(path.join(profileDir(name), "meta.json"), {});
+    return {
+      name,
+      type: meta.type || "oauth",
+      email: meta.email || null,
+      savedAt: meta.savedAt || null,
+      active: name === active,
+    };
+  });
+}
+
+export function getActive() {
+  return readJson(ACTIVE_PATH, {})?.name || null;
+}
+
+export function setActive(name) {
+  writeJson(ACTIVE_PATH, { name, switchedAt: new Date().toISOString() });
+}
+
+/**
+ * Snapshot current live OAuth (WinCred + ~/.gemini files) into a named profile.
+ * Like saving a "cookie jar" for later restore — no browser needed on switch.
+ */
+export function saveAccount(name, { asApiKey, apiKey, note } = {}) {
+  ensureDir(ACCOUNTS_DIR);
+  const dir = profileDir(name);
+  ensureDir(dir);
+
+  if (asApiKey || apiKey) {
+    if (!apiKey) throw new Error("apiKey required for API-key profile");
+    writeJson(path.join(dir, "meta.json"), {
+      type: "apikey",
+      email: null,
+      note: note || null,
+      savedAt: new Date().toISOString(),
+    });
+    // store key privately in profile (local machine only)
+    fs.writeFileSync(path.join(dir, "api_key.txt"), String(apiKey).trim(), "utf8");
+    setActive(name);
+    return { name, type: "apikey", active: true };
+  }
+
+  const cred = runWinCred("read");
+  if (!cred.exists || !cred.blobB64) {
+    throw new Error(
+      "No live Antigravity OAuth in Windows Credential Manager (gemini:antigravity). Run `agy` once to login, then save."
+    );
+  }
+
+  const email = currentEmail();
+  writeJson(path.join(dir, "meta.json"), {
+    type: "oauth",
+    email,
+    username: cred.username || "antigravity",
+    note: note || null,
+    savedAt: new Date().toISOString(),
+    blobSize: cred.blobSize,
+  });
+  fs.writeFileSync(path.join(dir, "wincred.b64"), cred.blobB64, "utf8");
+
+  if (fs.existsSync(OAUTH_CREDS)) {
+    fs.copyFileSync(OAUTH_CREDS, path.join(dir, "oauth_creds.json"));
+  }
+  if (fs.existsSync(GOOGLE_ACCOUNTS)) {
+    fs.copyFileSync(GOOGLE_ACCOUNTS, path.join(dir, "google_accounts.json"));
+  }
+  if (fs.existsSync(AGY_OAUTH_FILE)) {
+    fs.copyFileSync(AGY_OAUTH_FILE, path.join(dir, "antigravity-oauth-token"));
+  }
+
+  // remember settings snippet for oauth mode (no modelProvider=gemini)
+  const settings = readJson(AGY_SETTINGS, {});
+  writeJson(path.join(dir, "settings.snippet.json"), {
+    toolPermission: settings.toolPermission || "always-proceed",
+    artifactReviewPolicy: settings.artifactReviewPolicy || "always-proceed",
+    // ensure account mode uses Google login, not API key
+    clearModelProvider: true,
+  });
+
+  setActive(name);
+  return { name, type: "oauth", email, active: true };
+}
+
+/**
+ * Restore a saved profile into the live credential slots (no browser).
+ */
+export function switchAccount(name) {
+  const dir = profileDir(name);
+  if (!fs.existsSync(dir)) throw new Error(`account not found: ${name}`);
+  const meta = readJson(path.join(dir, "meta.json"), {});
+
+  if (meta.type === "apikey") {
+    const keyPath = path.join(dir, "api_key.txt");
+    if (!fs.existsSync(keyPath)) throw new Error(`missing api_key.txt for ${name}`);
+    const apiKey = fs.readFileSync(keyPath, "utf8").trim();
+    const settings = readJson(AGY_SETTINGS, {});
+    writeJson(AGY_SETTINGS, {
+      ...settings,
+      modelProvider: "gemini",
+      toolPermission: settings.toolPermission || "always-proceed",
+      artifactReviewPolicy: settings.artifactReviewPolicy || "always-proceed",
+    });
+    // Persist key for subsequent shells of this tool via profile env file
+    writeJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {
+      GEMINI_API_KEY: apiKey,
+      AGY_ACCOUNT: name,
+      AGY_ACCOUNT_TYPE: "apikey",
+    });
+    setActive(name);
+    return {
+      name,
+      type: "apikey",
+      email: null,
+      hint: "API key mode active. agy-auto will inject GEMINI_API_KEY automatically.",
+    };
+  }
+
+  const b64Path = path.join(dir, "wincred.b64");
+  if (!fs.existsSync(b64Path)) throw new Error(`missing wincred.b64 for ${name}`);
+  const blobB64 = fs.readFileSync(b64Path, "utf8").trim();
+  const username = meta.username || "antigravity";
+  runWinCred("write", { blobB64, username });
+
+  if (fs.existsSync(path.join(dir, "oauth_creds.json"))) {
+    ensureDir(GEMINI_DIR);
+    fs.copyFileSync(path.join(dir, "oauth_creds.json"), OAUTH_CREDS);
+  }
+  if (fs.existsSync(path.join(dir, "google_accounts.json"))) {
+    fs.copyFileSync(path.join(dir, "google_accounts.json"), GOOGLE_ACCOUNTS);
+  }
+  if (fs.existsSync(path.join(dir, "antigravity-oauth-token"))) {
+    ensureDir(path.dirname(AGY_OAUTH_FILE));
+    fs.copyFileSync(
+      path.join(dir, "antigravity-oauth-token"),
+      AGY_OAUTH_FILE
+    );
+  }
+
+  // Back to Google-account auth (remove API-key provider)
+  const settings = readJson(AGY_SETTINGS, {});
+  const next = { ...settings };
+  delete next.modelProvider;
+  next.toolPermission = next.toolPermission || "always-proceed";
+  next.artifactReviewPolicy = next.artifactReviewPolicy || "always-proceed";
+  writeJson(AGY_SETTINGS, next);
+
+  writeJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {
+    AGY_ACCOUNT: name,
+    AGY_ACCOUNT_TYPE: "oauth",
+  });
+  // clear any lingering key from env file
+  setActive(name);
+  return {
+    name,
+    type: "oauth",
+    email: meta.email || currentEmail(),
+    hint: "OAuth restored to Windows Credential Manager. No browser needed.",
+  };
+}
+
+export function removeAccount(name) {
+  const dir = profileDir(name);
+  if (!fs.existsSync(dir)) throw new Error(`account not found: ${name}`);
+  fs.rmSync(dir, { recursive: true, force: true });
+  const active = getActive();
+  if (active === name) {
+    if (fs.existsSync(ACTIVE_PATH)) fs.unlinkSync(ACTIVE_PATH);
+    const runtime = path.join(ACCOUNTS_DIR, "runtime.env.json");
+    if (fs.existsSync(runtime)) fs.unlinkSync(runtime);
+  }
+  return { removed: name };
+}
+
+/**
+ * Clear live OAuth so the NEXT `agy` interactive login can bind a new Google account.
+ * Does not delete saved profiles.
+ */
+export function clearLiveAuth() {
+  runWinCred("delete");
+  for (const p of [OAUTH_CREDS, AGY_OAUTH_FILE]) {
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  }
+  // keep google_accounts.json but mark empty-ish
+  writeJson(GOOGLE_ACCOUNTS, { active: null, old: [] });
+  return { cleared: true };
+}
+
+export function whoami() {
+  const active = getActive();
+  const email = currentEmail();
+  const cred = runWinCred("exists");
+  const runtime = readJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {});
+  return {
+    activeProfile: active,
+    email,
+    wincredExists: Boolean(cred.exists),
+    accountType: runtime.AGY_ACCOUNT_TYPE || (active ? listProfiles().find((p) => p.name === active)?.type : null),
+  };
+}
+
+/**
+ * Env overlays for the active profile (used by runner/server).
+ */
+export function getRuntimeEnv() {
+  const runtime = readJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {});
+  const env = {};
+  if (runtime.GEMINI_API_KEY) env.GEMINI_API_KEY = runtime.GEMINI_API_KEY;
+  if (runtime.AGY_ACCOUNT) env.AGY_ACCOUNT = runtime.AGY_ACCOUNT;
+  return env;
+}
+
+export function applyActiveProfileEnv(baseEnv = process.env) {
+  return { ...baseEnv, ...getRuntimeEnv() };
+}
+
+export const accountsApi = {
+  saveAccount,
+  switchAccount,
+  removeAccount,
+  clearLiveAuth,
+  listProfiles,
+  whoami,
+  getActive,
+  getRuntimeEnv,
+  applyActiveProfileEnv,
+  ACCOUNTS_DIR,
+};

@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Antigravity Console</title>
+<link rel="stylesheet" href="/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>" />
+</head>
+<body>
+
+<!-- ============ 侧边栏 ============ -->
+<aside id="sidebar">
+  <div class="brand">
+    <div class="brand-logo">✦</div>
+    <div class="brand-text">
+      <span class="brand-name">Antigravity</span>
+      <span class="brand-sub">Console</span>
+    </div>
+  </div>
+
+  <button class="btn-new-chat" id="btnNewChat">
+    <span class="plus">＋</span> New conversation
+  </button>
+
+  <div class="side-section">
+    <div class="side-label">History</div>
+    <div id="historyList" class="history-list">
+      <div class="history-empty">暂无历史对话</div>
+    </div>
+  </div>
+
+  <div class="side-footer">
+    <div class="conn-dot" id="connDot"></div>
+    <div class="conn-info">
+      <span id="connText">Connecting…</span>
+      <span class="conn-url" id="connUrl">127.0.0.1:8787</span>
+    </div>
+  </div>
+</aside>
+
+<!-- ============ 主区域 ============ -->
+<main id="main">
+
+  <!-- 顶栏 -->
+  <header id="topbar">
+    <div class="topbar-left">
+      <button class="icon-btn" id="btnToggleSide" title="收起/展开侧栏">☰</button>
+      <div class="model-picker" id="modelPicker">
+        <button class="model-btn" id="modelBtn">
+          <span class="sparkle">✦</span>
+          <span id="modelName">Loading…</span>
+          <span class="chev">▾</span>
+        </button>
+        <div class="model-menu hidden" id="modelMenu"></div>
+      </div>
+      <select id="effortSelect" class="effort-select" title="Reasoning effort">
+        <option value="">Effort: auto</option>
+        <option value="low">Effort: low</option>
+        <option value="medium">Effort: medium</option>
+        <option value="high">Effort: high</option>
+        <option value="max">Effort: max</option>
+      </select>
+    </div>
+
+    <div class="topbar-right">
+      <button class="pill-btn" id="quotaBtn" title="查看用量 / 配额">
+        <span class="pill-ico">◔</span> Quotas
+      </button>
+      <div class="account-chip" id="accountChip" title="账号管理">
+        <div class="avatar" id="avatarLetter">?</div>
+        <span id="accountEmail">—</span>
+        <span class="chev">▾</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- 消息区 -->
+  <div id="chatScroll">
+    <div id="chatEmpty" class="chat-empty">
+      <div class="empty-logo">✦</div>
+      <h1>让 Antigravity 为你干活</h1>
+      <p>自动同意模式已开启（--dangerously-skip-permissions），输入任务即可执行。</p>
+      <div class="sugg-grid">
+        <button class="sugg" data-prompt="列出当前目录下的所有文件并说明用途">📂 列出当前目录文件</button>
+        <button class="sugg" data-prompt="阅读 docs/API.md 并总结这个后端的能力">📄 总结 docs/API.md</button>
+        <button class="sugg" data-prompt="检查 package.json 并告诉我如何启动服务">▶️ 怎么启动服务</button>
+        <button class="sugg" data-prompt="查看最近的 git 提交记录并简要总结">🌿 最近 git 提交</button>
+      </div>
+    </div>
+    <div id="chatList"></div>
+  </div>
+
+  <!-- 输入区 -->
+  <footer id="composer">
+    <div class="composer-box">
+      <textarea id="promptInput" rows="1" placeholder="给 Antigravity 一个任务…  (Enter 发送, Shift+Enter 换行)"></textarea>
+      <div class="composer-bar">
+        <div class="composer-left">
+          <input type="text" id="cwdInput" class="cwd-input" placeholder="工作目录（可选，默认 prefs/defaultCwd）" />
+        </div>
+        <div class="composer-right">
+          <label class="cont-label" title="续接上一次对话">
+            <input type="checkbox" id="continueChk" /> 续聊
+          </label>
+          <button id="sendBtn" class="send-btn" title="发送">
+            <span id="sendIco">➤</span>
+          </button>
+        </div>
+      </div>
+    </div>
+    <div class="composer-hint">一次请求可能跑很久（最长 10 分钟），请耐心等待 · 后端 http://127.0.0.1:8787</div>
+  </footer>
+</main>
+
+<!-- ============ Quota 面板 ============ -->
+<div class="drawer-mask hidden" id="quotaMask"></div>
+<aside class="drawer hidden" id="quotaDrawer">
+  <div class="drawer-head">
+    <div>
+      <h2 id="quotaTitle">Model Quotas</h2>
+      <p class="drawer-desc" id="quotaDesc"></p>
+    </div>
+    <div class="drawer-actions">
+      <button class="icon-btn" id="quotaRefresh" title="强制刷新">⟳</button>
+      <button class="icon-btn" data-close="quota">✕</button>
+    </div>
+  </div>
+  <div class="drawer-body" id="quotaBody">
+    <div class="loading-line">加载中…</div>
+  </div>
+  <div class="drawer-foot" id="quotaFoot"></div>
+</aside>
+
+<!-- ============ Account 面板 ============ -->
+<div class="drawer-mask hidden" id="accountMask"></div>
+<aside class="drawer hidden" id="accountDrawer">
+  <div class="drawer-head">
+    <div>
+      <h2>账号管理</h2>
+      <p class="drawer-desc">切换免浏览器（写入 Windows 凭据管理器）</p>
+    </div>
+    <div class="drawer-actions">
+      <button class="icon-btn" id="accountRefresh" title="刷新">⟳</button>
+      <button class="icon-btn" data-close="account">✕</button>
+    </div>
+  </div>
+  <div class="drawer-body">
+    <div class="acct-now" id="acctNow"></div>
+    <div class="side-label">Saved profiles</div>
+    <div id="acctList"></div>
+    <div class="acct-add">
+      <div class="side-label">保存当前登录为新 profile</div>
+      <div class="row">
+        <input type="text" id="newAcctName" placeholder="profile 名称，如 work" />
+        <button class="btn" id="btnSaveAcct">Save</button>
+      </div>
+      <div class="hint-text">加新号流程：Clear live → 终端跑一次 <code>agy</code> 浏览器登录 → 回到这里 Save</div>
+      <button class="btn btn-danger-ghost" id="btnClearLive">Clear live login</button>
+    </div>
+  </div>
+</aside>
+
+<div id="toastWrap"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

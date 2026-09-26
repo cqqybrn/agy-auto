@@ -1,0 +1,104 @@
+import { spawnSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { applyActiveProfileEnv } from "./accounts.js";
+import { resolveAgyBinary } from "./agyRunner.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const PREFS_PATH = path.join(ROOT, "accounts", "prefs.json");
+
+function readJson(p, fallback = null) {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf8"));
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(p, obj) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
+}
+
+/**
+ * Parse `agy models` output:
+ *   gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+ */
+export function listModels() {
+  const bin = resolveAgyBinary();
+  const env = applyActiveProfileEnv(process.env);
+  const r = spawnSync(bin, ["models"], {
+    encoding: "utf8",
+    env: {
+      ...env,
+      PATH: `${path.dirname(bin)}${path.delimiter}${env.PATH || ""}`,
+    },
+    windowsHide: true,
+    timeout: 60_000,
+  });
+  if (r.error) throw r.error;
+  const text = `${r.stdout || ""}\n${r.stderr || ""}`;
+  const models = [];
+  for (const line of text.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t || t.toLowerCase().includes("fetching")) continue;
+    // id<TAB>label  or  id  spaces  label
+    const m = t.match(/^([a-z0-9][\w.-]*)\s+(.+)$/i);
+    if (!m) continue;
+    const id = m[1];
+    const label = m[2].trim();
+    if (id === "Fetching") continue;
+    models.push({
+      id,
+      object: "model",
+      owned_by: "antigravity",
+      label,
+      // Official Models dropdown uses display_name like "Claude Sonnet 4.6 (Thinking)"
+      display_name: label,
+      // Group for UI: matches official quota panel groups
+      group:
+        id.startsWith("gemini")
+          ? "Gemini Models"
+          : id.startsWith("claude") || id.startsWith("gpt")
+            ? "Claude and GPT models"
+            : "Other",
+    });
+  }
+  // de-dupe by id
+  const seen = new Set();
+  const uniq = [];
+  for (const m of models) {
+    if (seen.has(m.id)) continue;
+    seen.add(m.id);
+    uniq.push(m);
+  }
+  return uniq;
+}
+
+export function getPrefs() {
+  return readJson(PREFS_PATH, {
+    defaultModel: null,
+    defaultEffort: null,
+    defaultCwd: null,
+  });
+}
+
+export function setPrefs(patch = {}) {
+  const cur = getPrefs();
+  const next = {
+    ...cur,
+    ...patch,
+    updatedAt: new Date().toISOString(),
+  };
+  writeJson(PREFS_PATH, next);
+  return next;
+}
+
+export function resolveDefaultModel(explicit) {
+  if (explicit && !["antigravity", "agy", "default"].includes(explicit)) {
+    return explicit;
+  }
+  return getPrefs().defaultModel || undefined;
+}
