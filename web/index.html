@@ -3,118 +3,147 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<meta name="color-scheme" content="dark light" />
 <title>Antigravity Console</title>
-<link rel="stylesheet" href="/styles.css" />
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🚀</text></svg>" />
+<link rel="stylesheet" href="styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><defs><linearGradient id='g' x1='0' x2='1'><stop offset='0' stop-color='%234f8ff7'/><stop offset='.5' stop-color='%23a178f2'/><stop offset='1' stop-color='%23f28b60'/></linearGradient></defs><path d='M6 27C6 13 10.5 5 16 5s10 8 10 22' fill='none' stroke='url(%23g)' stroke-width='5.5' stroke-linecap='round'/></svg>" />
+<script>
+(() => {
+  try {
+    const raw = localStorage.getItem("agy.theme");
+    let pref = "system";
+    if (raw != null) {
+      try { pref = JSON.parse(raw); } catch { pref = raw; }
+    }
+    if (pref !== "light" && pref !== "dark" && pref !== "system") pref = "system";
+    const sys = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+    const theme = pref === "system" ? sys : pref;
+    document.documentElement.dataset.theme = theme;
+    document.documentElement.style.colorScheme = theme;
+  } catch (_) { /* ignore */ }
+})();
+</script>
 </head>
 <body>
 
-<!-- ============ 侧边栏 ============ -->
-<aside id="sidebar">
-  <div class="brand">
-    <div class="brand-logo">✦</div>
-    <div class="brand-text">
-      <span class="brand-name">Antigravity</span>
-      <span class="brand-sub">Console</span>
-    </div>
-  </div>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <linearGradient id="agGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4f8ff7" />
+      <stop offset=".5" stop-color="#a178f2" />
+      <stop offset="1" stop-color="#f28b60" />
+    </linearGradient>
+  </defs>
+  <symbol id="agLogo" viewBox="0 0 32 32">
+    <path d="M6 27C6 13 10.5 5 16 5s10 8 10 22" fill="none" stroke="url(#agGrad)" stroke-width="5.5" stroke-linecap="round" />
+  </symbol>
+</svg>
 
-  <button class="btn-new-chat" id="btnNewChat">
-    <span class="plus">＋</span> New conversation
-  </button>
+<div id="app">
 
-  <div class="side-section">
-    <div class="side-label">History</div>
-    <div id="historyList" class="history-list">
-      <div class="history-empty">暂无历史对话</div>
-    </div>
-  </div>
-
-  <div class="side-footer">
-    <div class="conn-dot" id="connDot"></div>
-    <div class="conn-info">
-      <span id="connText">Connecting…</span>
-      <span class="conn-url" id="connUrl">127.0.0.1:8787</span>
-    </div>
-  </div>
-</aside>
-
-<!-- ============ 主区域 ============ -->
-<main id="main">
-
-  <!-- 顶栏 -->
-  <header id="topbar">
-    <div class="topbar-left">
-      <button class="icon-btn" id="btnToggleSide" title="收起/展开侧栏">☰</button>
-      <div class="model-picker" id="modelPicker">
-        <button class="model-btn" id="modelBtn">
-          <span class="sparkle">✦</span>
-          <span id="modelName">Loading…</span>
-          <span class="chev">▾</span>
-        </button>
-        <div class="model-menu hidden" id="modelMenu"></div>
+  <!-- ============ Sidebar ============ -->
+  <aside id="sidebar">
+    <div class="brand">
+      <svg class="brand-mark"><use href="#agLogo" /></svg>
+      <div class="brand-text">
+        <span class="brand-name">Antigravity</span>
+        <span class="brand-sub">Agent Console</span>
       </div>
-      <select id="effortSelect" class="effort-select" title="Reasoning effort">
-        <option value="">Effort: auto</option>
-        <option value="low">Effort: low</option>
-        <option value="medium">Effort: medium</option>
-        <option value="high">Effort: high</option>
-        <option value="max">Effort: max</option>
-      </select>
+      <button class="icon-btn sm" id="btnCollapse" title="收起侧栏"><i data-i="panel"></i></button>
     </div>
 
-    <div class="topbar-right">
-      <button class="pill-btn" id="quotaBtn" title="查看用量 / 配额">
-        <span class="pill-ico">◔</span> Quotas
+    <button class="new-chat" id="btnNewChat">
+      <i data-i="plus"></i><span>New conversation</span><kbd>Ctrl K</kbd>
+    </button>
+
+    <label class="side-search">
+      <i data-i="search"></i>
+      <input id="convSearch" type="text" placeholder="搜索对话" autocomplete="off" />
+    </label>
+
+    <nav id="convList" class="conv-list"></nav>
+
+    <div class="side-foot">
+      <button class="runs-pill hidden" id="runsPill" title="进行中的任务">
+        <span class="spin"></span><span id="runsCount">0</span> running
       </button>
-      <div class="account-chip" id="accountChip" title="账号管理">
-        <div class="avatar" id="avatarLetter">?</div>
-        <span id="accountEmail">—</span>
-        <span class="chev">▾</span>
-      </div>
-    </div>
-  </header>
-
-  <!-- 消息区 -->
-  <div id="chatScroll">
-    <div id="chatEmpty" class="chat-empty">
-      <div class="empty-logo">✦</div>
-      <h1>让 Antigravity 为你干活</h1>
-      <p>自动同意模式已开启（--dangerously-skip-permissions），输入任务即可执行。</p>
-      <div class="sugg-grid">
-        <button class="sugg" data-prompt="列出当前目录下的所有文件并说明用途">📂 列出当前目录文件</button>
-        <button class="sugg" data-prompt="阅读 docs/API.md 并总结这个后端的能力">📄 总结 docs/API.md</button>
-        <button class="sugg" data-prompt="检查 package.json 并告诉我如何启动服务">▶️ 怎么启动服务</button>
-        <button class="sugg" data-prompt="查看最近的 git 提交记录并简要总结">🌿 最近 git 提交</button>
-      </div>
-    </div>
-    <div id="chatList"></div>
-  </div>
-
-  <!-- 输入区 -->
-  <footer id="composer">
-    <div class="composer-box">
-      <textarea id="promptInput" rows="1" placeholder="给 Antigravity 一个任务…  (Enter 发送, Shift+Enter 换行)"></textarea>
-      <div class="composer-bar">
-        <div class="composer-left">
-          <input type="text" id="cwdInput" class="cwd-input" placeholder="工作目录（可选，默认 prefs/defaultCwd）" />
-        </div>
-        <div class="composer-right">
-          <label class="cont-label" title="续接上一次对话">
-            <input type="checkbox" id="continueChk" /> 续聊
-          </label>
-          <button id="sendBtn" class="send-btn" title="发送">
-            <span id="sendIco">➤</span>
-          </button>
+      <div class="conn" id="connBox" title="后端连接">
+        <span class="conn-dot" id="connDot"></span>
+        <div class="conn-info">
+          <span id="connText">Connecting…</span>
+          <span class="conn-url" id="connUrl"></span>
         </div>
       </div>
+      <button class="icon-btn" id="btnTheme" title="切换主题"><i data-i="sun"></i></button>
+      <button class="icon-btn" id="btnSettings" title="设置"><i data-i="settings"></i></button>
     </div>
-    <div class="composer-hint">一次请求可能跑很久（最长 10 分钟），请耐心等待 · 后端 http://127.0.0.1:8787</div>
-  </footer>
-</main>
+  </aside>
 
-<!-- ============ Quota 面板 ============ -->
-<div class="drawer-mask hidden" id="quotaMask"></div>
+  <!-- ============ Main ============ -->
+  <main id="main" class="is-empty">
+    <header id="topbar">
+      <button class="icon-btn" id="btnExpand" title="展开侧栏"><i data-i="panel"></i></button>
+      <div class="title-wrap">
+        <input id="convTitle" class="conv-title" value="New conversation" spellcheck="false" />
+        <span class="conv-id hidden" id="convIdChip" title="点击复制 conversation_id"></span>
+      </div>
+      <div class="top-right">
+        <button class="qmeter" id="quotaBtn" title="Model Quotas">
+          <span class="qm-empty">Quotas</span>
+        </button>
+        <button class="account-chip" id="accountChip" title="账号管理">
+          <span class="avatar" id="avatarLetter">?</span>
+          <span class="acct-mail" id="accountEmail">—</span>
+          <i data-i="chevDown" class="chev"></i>
+        </button>
+      </div>
+    </header>
+
+    <section id="thread">
+      <div id="threadInner"></div>
+    </section>
+
+    <footer id="composerWrap">
+      <div class="composer" id="composer">
+        <textarea id="promptInput" rows="1" placeholder="Ask anything, or describe a task for the agent…" spellcheck="false"></textarea>
+        <div class="composer-bar">
+          <div class="cb-left">
+            <div class="pop-anchor">
+              <button class="chip" id="cwdChip" title="工作目录"><i data-i="folder"></i><span id="cwdLabel">Workspace</span></button>
+              <div class="popover hidden" id="cwdPop"></div>
+            </div>
+            <div class="pop-anchor">
+              <button class="chip" id="agentChip" title="Agent"><i data-i="layers"></i><span id="agentLabel">Default agent</span></button>
+              <div class="popover hidden" id="agentPop"></div>
+            </div>
+            <div class="pop-anchor">
+              <button class="chip icon-only" id="advChip" title="高级选项"><i data-i="sliders"></i></button>
+              <div class="popover hidden" id="advPop"></div>
+            </div>
+          </div>
+          <div class="cb-right">
+            <div class="pop-anchor">
+              <button class="chip" id="effortChip" title="Reasoning effort"><i data-i="zap"></i><span id="effortLabel">Auto</span></button>
+              <div class="popover right hidden" id="effortPop"></div>
+            </div>
+            <div class="pop-anchor">
+              <button class="chip model" id="modelChip" title="模型"><span class="model-dot" id="modelDot"></span><span id="modelLabel">Loading…</span><i data-i="chevDown" class="chev"></i></button>
+              <div class="popover right wide hidden" id="modelPop"></div>
+            </div>
+            <button id="sendBtn" class="send-btn" title="发送 (Enter)"><i data-i="arrowUp"></i></button>
+          </div>
+        </div>
+      </div>
+      <div class="composer-hint" id="composerHint">
+        <span class="auto-dot"></span>Auto-approve on · 所有写文件 / 跑命令将自动执行
+      </div>
+    </footer>
+  </main>
+</div>
+
+<!-- ============ Drawers ============ -->
+<div class="mask hidden" id="mask"></div>
+
 <aside class="drawer hidden" id="quotaDrawer">
   <div class="drawer-head">
     <div>
@@ -122,47 +151,54 @@
       <p class="drawer-desc" id="quotaDesc"></p>
     </div>
     <div class="drawer-actions">
-      <button class="icon-btn" id="quotaRefresh" title="强制刷新">⟳</button>
-      <button class="icon-btn" data-close="quota">✕</button>
+      <button class="icon-btn" id="quotaRefresh" title="强制刷新"><i data-i="refresh"></i></button>
+      <button class="icon-btn" data-close title="关闭"><i data-i="x"></i></button>
     </div>
   </div>
-  <div class="drawer-body" id="quotaBody">
-    <div class="loading-line">加载中…</div>
-  </div>
+  <div class="drawer-body" id="quotaBody"></div>
   <div class="drawer-foot" id="quotaFoot"></div>
 </aside>
 
-<!-- ============ Account 面板 ============ -->
-<div class="drawer-mask hidden" id="accountMask"></div>
 <aside class="drawer hidden" id="accountDrawer">
   <div class="drawer-head">
     <div>
-      <h2>账号管理</h2>
-      <p class="drawer-desc">切换免浏览器（写入 Windows 凭据管理器）</p>
+      <h2>Accounts</h2>
+      <p class="drawer-desc">切换免浏览器登录（写入 Windows 凭据管理器）</p>
     </div>
     <div class="drawer-actions">
-      <button class="icon-btn" id="accountRefresh" title="刷新">⟳</button>
-      <button class="icon-btn" data-close="account">✕</button>
+      <button class="icon-btn" id="accountRefresh" title="刷新"><i data-i="refresh"></i></button>
+      <button class="icon-btn" data-close title="关闭"><i data-i="x"></i></button>
     </div>
   </div>
-  <div class="drawer-body">
-    <div class="acct-now" id="acctNow"></div>
-    <div class="side-label">Saved profiles</div>
-    <div id="acctList"></div>
-    <div class="acct-add">
-      <div class="side-label">保存当前登录为新 profile</div>
-      <div class="row">
-        <input type="text" id="newAcctName" placeholder="profile 名称，如 work" />
-        <button class="btn" id="btnSaveAcct">Save</button>
-      </div>
-      <div class="hint-text">加新号流程：Clear live → 终端跑一次 <code>agy</code> 浏览器登录 → 回到这里 Save</div>
-      <button class="btn btn-danger-ghost" id="btnClearLive">Clear live login</button>
-    </div>
-  </div>
+  <div class="drawer-body" id="accountBody"></div>
 </aside>
+
+<aside class="drawer hidden" id="settingsDrawer">
+  <div class="drawer-head">
+    <div>
+      <h2>Settings</h2>
+      <p class="drawer-desc">连接、默认偏好、运行中的任务与能力说明</p>
+    </div>
+    <div class="drawer-actions">
+      <button class="icon-btn" data-close title="关闭"><i data-i="x"></i></button>
+    </div>
+  </div>
+  <div class="drawer-body" id="settingsBody"></div>
+</aside>
+
+<!-- ============ Modal ============ -->
+<div class="modal-wrap hidden" id="modalWrap">
+  <div class="modal" role="dialog">
+    <div class="modal-head">
+      <h3 id="modalTitle"></h3>
+      <button class="icon-btn" id="modalClose" title="关闭"><i data-i="x"></i></button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+  </div>
+</div>
 
 <div id="toastWrap"></div>
 
-<script src="/app.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
