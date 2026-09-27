@@ -5,6 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { applyActiveProfileEnv } from "./accounts.js";
+import { resolveAgyBinary as _resolveAgyBinaryShared } from "./utils.js";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 0);
 
@@ -12,17 +13,7 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 0);
 export const activeRuns = new Map();
 
 export function resolveAgyBinary() {
-  if (process.env.AGY_BIN && existsSync(process.env.AGY_BIN)) {
-    return process.env.AGY_BIN;
-  }
-  const local = path.join(
-    process.env.LOCALAPPDATA || "",
-    "agy",
-    "bin",
-    process.platform === "win32" ? "agy.exe" : "agy"
-  );
-  if (existsSync(local)) return local;
-  return process.platform === "win32" ? "agy.exe" : "agy";
+  return _resolveAgyBinaryShared();
 }
 
 export function buildAgyArgs({
@@ -243,6 +234,14 @@ export function normalizeStreamEvent(raw) {
       raw,
     };
   }
+  if (raw.event === "thought" || raw.event === "thinking") {
+    return {
+      type: "thinking",
+      text_delta: raw.thought || raw.thinking || raw.text_delta || "",
+      thinking: raw.thought || raw.thinking || raw.text_delta || "",
+      raw,
+    };
+  }
   if (raw.event === "step_update" && raw.step_update) {
     const s = raw.step_update;
     const base = {
@@ -253,26 +252,52 @@ export function normalizeStreamEvent(raw) {
       conversation_id: s.conversation_id,
       duration_seconds: s.duration_seconds,
       usage: s.usage,
+      thinking: s.thinking || s.thought || null,
       raw,
     };
 
+    if (s.step_type === "thought" || s.step_type === "thinking") {
+      return {
+        ...base,
+        type: "thinking",
+        text_delta: s.thinking || s.thought || s.text_delta || s.content || "",
+        thinking: s.thinking || s.thought || s.text_delta || s.content || "",
+      };
+    }
     if (s.step_type === "agent_response" && s.text_delta != null) {
       return { ...base, type: "text_delta", text_delta: s.text_delta };
     }
-    if (s.step_type === "tool" || s.tool_name || s.tool_info) {
-      return {
-        ...base,
-        type: "tool",
-        tool_name: s.tool_name || s.tool_info?.name || null,
-        tool_info: s.tool_info || null,
-      };
-    }
-    if (s.step_type === "subagent" || s.subagent_info) {
-      const subs = s.subagent_info?.subagents || [];
+    if (
+      s.tool_name === "invoke_subagent" ||
+      s.tool_info?.name === "invoke_subagent" ||
+      s.step_type === "subagent" ||
+      s.subagent_info
+    ) {
+      const toolInfo = s.tool_info || {};
+      const args = toolInfo.args || toolInfo.arguments || toolInfo.parameters || toolInfo.input || {};
+      let subs = s.subagent_info?.subagents || [];
+      if (!subs.length) {
+        let rawSubs = args.Subagents || args.subagents || args.agents;
+        if (typeof rawSubs === "string") {
+          try {
+            rawSubs = JSON.parse(rawSubs);
+          } catch {}
+        }
+        if (Array.isArray(rawSubs)) {
+          subs = rawSubs.map((sa) => ({
+            type_name: sa.TypeName || sa.type_name || "self",
+            role: sa.Role || sa.role || "subagent",
+            initial_prompt: sa.Prompt || sa.prompt || null,
+            conversation_id: sa.conversation_id || null,
+            workspace_uris: sa.Workspace ? [sa.Workspace] : [],
+          }));
+        }
+      }
       return {
         ...base,
         type: "subagent",
-        tool_name: s.tool_name || "invoke_subagent",
+        tool_name: "invoke_subagent",
+        tool_info: toolInfo,
         subagents: subs.map((sa) => ({
           type_name: sa.type_name,
           role: sa.role,
@@ -280,10 +305,17 @@ export function normalizeStreamEvent(raw) {
           conversation_id: sa.conversation_id,
           log_uri: sa.log_uri,
           workspace_uris: sa.workspace_uris,
-          // Convenience path for GET /v1/transcripts/:id
           transcript_id: sa.conversation_id || null,
         })),
-        subagent_info: s.subagent_info,
+        subagent_info: s.subagent_info || { subagents: subs },
+      };
+    }
+    if (s.step_type === "tool" || s.tool_name || s.tool_info) {
+      return {
+        ...base,
+        type: "tool",
+        tool_name: s.tool_name || s.tool_info?.name || null,
+        tool_info: s.tool_info || null,
       };
     }
     if (s.step_type === "system_message") {

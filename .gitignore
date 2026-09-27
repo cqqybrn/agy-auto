@@ -1,7 +1,33 @@
+# Dependencies
 node_modules/
+
+# Environment and credentials / configuration files
 .env
-*.log
+.env.*
+*.local
+*.secret
+*.token
+*.config.json
+runtime.env.json
+oauth-client.json
+active.json
+prefs.json
+
+# Accounts directory (contains credentials, tokens, and account data)
 accounts/
-!accounts/.gitkeep
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Temporary / runtime uploads and browser profiles
 .agy-uploads/
 .agy-oauth-chrome/
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

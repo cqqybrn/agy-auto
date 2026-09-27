@@ -34,7 +34,7 @@ import {
   resolveDefaultAgent,
   setPrefs,
 } from "./models.js";
-import { getUsage, recordLocalUsage } from "./usage.js";
+import { getUsage, recordLocalUsage, fetchAllAccountsQuotas, invalidateUsageCache } from "./usage.js";
 import { ensureBundledAgents, DEFAULT_AGENT_ID } from "./ensureAgent.js";
 
 const PORT = Number(process.env.PORT || 8787);
@@ -114,7 +114,9 @@ function tryServeStatic(req, res, pathname) {
   res.writeHead(200, {
     "Content-Type": MIME[ext] || "application/octet-stream",
     "Access-Control-Allow-Origin": "*",
-    "Cache-Control": "no-cache",
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
     "Content-Length": body.length,
   });
   res.end(body);
@@ -131,6 +133,15 @@ function sendJson(res, status, body) {
     "Content-Length": Buffer.byteLength(data),
   });
   res.end(data);
+}
+
+/** Safe wrapper — never throws; returns null on error. */
+function safeWhoamiEmail() {
+  try {
+    return whoami()?.email || null;
+  } catch {
+    return null;
+  }
 }
 
 function readBody(req) {
@@ -368,6 +379,14 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { accounts: listProfiles(), whoami: whoami() });
     }
 
+    if (req.method === "GET" && url.pathname === "/v1/accounts/quotas") {
+      const force =
+        url.searchParams.get("refresh") === "1" ||
+        url.searchParams.get("force") === "1";
+      const data = await fetchAllAccountsQuotas({ force });
+      return sendJson(res, 200, data);
+    }
+
     if (req.method === "GET" && url.pathname === "/v1/accounts/whoami") {
       return sendJson(res, 200, whoami());
     }
@@ -447,6 +466,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       if (!body.name) throw bad("name required");
       const result = switchAccount(body.name);
+      invalidateUsageCache();
       return sendJson(res, 200, { ok: true, ...result });
     }
 
@@ -461,7 +481,9 @@ const server = http.createServer(async (req, res) => {
         // avoid clashing with /v1/accounts/oauth/* ; also block junk names
         if (name.includes("/")) throw bad("invalid account name");
       }
-      return sendJson(res, 200, { ok: true, ...removeAccount(name) });
+      const r = removeAccount(name);
+      invalidateUsageCache(name);
+      return sendJson(res, 200, { ok: true, ...r });
     }
 
     // ---- agents / transcripts / runs ----
@@ -601,13 +623,7 @@ const server = http.createServer(async (req, res) => {
           model,
           usage: result.usage,
           conversationId: result.conversationId,
-          account: (() => {
-            try {
-              return whoami()?.email || null;
-            } catch {
-              return null;
-            }
-          })(),
+          account: safeWhoamiEmail(),
         });
       } catch {
         /* ignore local analytics errors */

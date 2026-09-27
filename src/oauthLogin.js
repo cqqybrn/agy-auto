@@ -9,14 +9,17 @@ import {
   syncLiveOAuthFilesFromWinCred,
   whoami,
   listProfiles,
+  decodeJwtEmail,
+  suggestProfileName,
+  invalidateWhoamiCache,
 } from "./accounts.js";
+import { readJson, writeJson, resolveAgyBinary, extractOauthClientFromBinary } from "./utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const WINCRED_PS1 = path.join(ROOT, "scripts", "wincred.ps1");
 const OAUTH_CLIENT_CACHE = path.join(ROOT, "accounts", "oauth-client.json");
 const OAUTH_CHROME_PROFILE = path.join(ROOT, ".agy-oauth-chrome");
-const PREFERRED_CLIENT_ID_PREFIX = "1071006060591-";
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -50,29 +53,36 @@ const SCOPES = [
 /** @type {Map<string, OAuthSession>} */
 const pending = new Map();
 
-function readJson(p, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
 
-function writeJson(p, obj) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
-}
+function resolveOauthClient() {
+  const fromEnv = {
+    client_id: process.env.AGY_OAUTH_CLIENT_ID,
+    client_secret: process.env.AGY_OAUTH_CLIENT_SECRET,
+  };
+  if (fromEnv.client_id && fromEnv.client_secret) return fromEnv;
 
-function findAgyExe() {
-  const candidates = [
-    process.env.AGY_BIN,
-    path.join(process.env.LOCALAPPDATA || "", "agy", "bin", "agy.exe"),
-    path.join(process.env.LOCALAPPDATA || "", "agy", "bin", "agy"),
-  ].filter(Boolean);
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
+  const fromFile = readJson(OAUTH_CLIENT_CACHE, null);
+  if (
+    fromFile?.client_id &&
+    fromFile?.client_secret &&
+    /^GOCSPX-[A-Za-z0-9_-]{28}$/.test(fromFile.client_secret)
+  ) {
+    return fromFile;
   }
-  return null;
+
+  const exe = resolveAgyBinary();
+  if (exe) {
+    const extracted = extractOauthClientFromBinary(exe);
+    if (extracted) {
+      try {
+        writeJson(OAUTH_CLIENT_CACHE, extracted);
+      } catch {
+        /* optional */
+      }
+      return extracted;
+    }
+  }
+  throw new Error("无法解析 Antigravity OAuth client，请确认已安装 agy");
 }
 
 function findChrome() {
@@ -95,53 +105,6 @@ function findChrome() {
   return null;
 }
 
-function extractOauthClientFromBinary(exePath) {
-  try {
-    const text = fs.readFileSync(exePath).toString("latin1");
-    const ids = [...text.matchAll(/[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com/g)].map((m) => m[0]);
-    // Google desktop secrets are "GOCSPX-" + 28 chars; avoid merging adjacent blobs
-    const secrets = [...text.matchAll(/GOCSPX-[A-Za-z0-9_-]{28}/g)].map((m) => m[0]);
-    if (!ids.length || !secrets.length) return null;
-    const clientId = ids.find((id) => id.startsWith(PREFERRED_CLIENT_ID_PREFIX)) || ids[0];
-    const unique = [...new Set(secrets)].filter((s) => s.length === 35 && !s.includes("http"));
-    const clientSecret = unique[0];
-    if (!clientSecret) return null;
-    return { client_id: clientId, client_secret: clientSecret };
-  } catch {
-    return null;
-  }
-}
-
-function resolveOauthClient() {
-  const fromEnv = {
-    client_id: process.env.AGY_OAUTH_CLIENT_ID,
-    client_secret: process.env.AGY_OAUTH_CLIENT_SECRET,
-  };
-  if (fromEnv.client_id && fromEnv.client_secret) return fromEnv;
-
-  const fromFile = readJson(OAUTH_CLIENT_CACHE, null);
-  if (
-    fromFile?.client_id &&
-    fromFile?.client_secret &&
-    /^GOCSPX-[A-Za-z0-9_-]{28}$/.test(fromFile.client_secret)
-  ) {
-    return fromFile;
-  }
-
-  const exe = findAgyExe();
-  if (exe) {
-    const extracted = extractOauthClientFromBinary(exe);
-    if (extracted) {
-      try {
-        writeJson(OAUTH_CLIENT_CACHE, extracted);
-      } catch {
-        /* optional */
-      }
-      return extracted;
-    }
-  }
-  throw new Error("无法解析 Antigravity OAuth client，请确认已安装 agy");
-}
 
 function b64url(buf) {
   return Buffer.from(buf)
@@ -159,7 +122,12 @@ function makePkce() {
 
 function openSystemBrowser(url) {
   if (process.platform === "win32") {
-    spawn("cmd.exe", ["/c", "start", "", url], { detached: true, stdio: "ignore" }).unref();
+    const safeUrl = String(url).replace(/'/g, "''");
+    spawn(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-Command", `Start-Process '${safeUrl}'`],
+      { detached: true, stdio: "ignore", windowsHide: true }
+    ).unref();
   } else if (process.platform === "darwin") {
     spawn("open", [url], { detached: true, stdio: "ignore" }).unref();
   } else {
@@ -424,21 +392,37 @@ function openInExistingChrome(url) {
   return false;
 }
 
-function readSystemClipboard() {
+function runPsAsync(args, timeoutMs = 8000) {
+  return new Promise((resolve) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", ...args], {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let out = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      resolve("");
+    }, timeoutMs);
+    child.stdout.on("data", (c) => { out += c; });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? out.trim() : "");
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve("");
+    });
+  });
+}
+
+async function readSystemClipboard() {
   try {
     if (process.platform === "win32") {
-      const r = spawnSync(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          "try { Get-Clipboard -Raw } catch { '' }",
-        ],
-        { encoding: "utf8", windowsHide: true, timeout: 5000 }
+      const out = await runPsAsync(
+        ["-Command", "try { Get-Clipboard -Raw } catch { '' }"],
+        4000
       );
-      return String(r.stdout || "").trim();
+      return String(out || "").trim();
     }
     if (process.platform === "darwin") {
       const r = spawnSync("pbpaste", [], { encoding: "utf8", timeout: 3000 });
@@ -463,19 +447,12 @@ function looksLikeAuthCode(text) {
   return /^[A-Za-z0-9_/\-.+=]+$/.test(t) && t.length >= 30;
 }
 
-function readChromeUrls() {
+async function readChromeUrls() {
   try {
     const script = path.join(ROOT, "scripts", "chrome-urls.ps1");
     if (!fs.existsSync(script)) return [];
-    const r = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
-      { encoding: "utf8", windowsHide: true, timeout: 8000 }
-    );
-    if (r.status !== 0) return [];
-    const out = String(r.stdout || "").trim();
+    const out = await runPsAsync(["-File", script], 8000);
     if (!out) return [];
-    // Ignore PowerShell errors printed to stdout
     if (out.startsWith("所在位置") || out.includes("ParserError")) return [];
     const parsed = JSON.parse(out);
     if (Array.isArray(parsed)) return parsed.map(String);
@@ -490,42 +467,43 @@ function readChromeUrls() {
  * Focus OAuth Chrome window briefly and Ctrl+L / Ctrl+C to copy the address bar.
  * Needed because Chrome often hides the omnibox URL from UI Automation.
  */
-function copyOmniboxUrlViaHotkey() {
+async function copyOmniboxUrlViaHotkey() {
   try {
     const script = path.join(ROOT, "scripts", "chrome-omnibox-copy.ps1");
     if (!fs.existsSync(script)) return "";
-    const r = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
-      { encoding: "utf8", windowsHide: true, timeout: 10000 }
-    );
-    return String(r.stdout || "").trim();
+    const out = await runPsAsync(["-File", script], 8000);
+    return String(out || "").trim();
   } catch {
     return "";
   }
 }
 
-function readAuthPageText() {
+async function readAuthPageText() {
   try {
     const script = path.join(ROOT, "scripts", "chrome-page-text.ps1");
     if (!fs.existsSync(script)) return "";
-    const r = spawnSync(
-      "powershell.exe",
-      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script],
-      { encoding: "utf8", windowsHide: true, timeout: 8000 }
-    );
-    return String(r.stdout || "").trim();
+    const out = await runPsAsync(["-File", script], 8000);
+    return String(out || "").trim();
   } catch {
     return "";
   }
 }
 
-function extractCodeFromText(text) {
+export function extractCodeFromText(text) {
   if (!text) return null;
+  const str = String(text).trim();
+  const m = str.match(/[?&#]code=([^&#\s]+)/i);
+  if (m?.[1]) {
+    try {
+      return decodeURIComponent(m[1]).trim();
+    } catch {
+      return m[1].trim();
+    }
+  }
   return (
-    codeFromUrl(text) ||
-    codeFromPageText(text) ||
-    (looksLikeAuthCode(text) ? String(text).trim().replace(/\s+/g, "") : null)
+    codeFromUrl(str) ||
+    codeFromPageText(str) ||
+    (looksLikeAuthCode(str) ? str.replace(/\s+/g, "") : null)
   );
 }
 
@@ -552,36 +530,26 @@ async function autoCaptureLoop(state) {
       const candidates = [];
 
       // 1) Address bars (may strip ?code=; still useful for detecting callback page)
-      for (const u of readChromeUrls()) {
+      const urls = await readChromeUrls();
+      for (const u of urls) {
         const c = extractCodeFromText(u);
         if (c) candidates.push(c);
       }
 
       // 2) Clipboard
-      const clip = readSystemClipboard();
+      const clip = await readSystemClipboard();
       if (clip) {
         const c = extractCodeFromText(clip);
         if (c) candidates.push(c);
       }
 
       // 3) Callback page text (code is shown on page: "Paste this code…")
-      const pageText = readAuthPageText();
+      const pageText = await readAuthPageText();
       if (pageText) {
         const c = extractCodeFromText(pageText);
         if (c) candidates.push(c);
         if (/Paste this code|Authentication/i.test(pageText)) {
           cur.hint = "capturing_url";
-        }
-      }
-
-      // 4) Rare omnibox hotkey copy — only if we still have nothing (disruptive)
-      if (!candidates.length && Date.now() - lastOmniboxTry > 4000) {
-        lastOmniboxTry = Date.now();
-        cur.hint = "capturing_url";
-        const copied = copyOmniboxUrlViaHotkey();
-        if (copied) {
-          const c = extractCodeFromText(copied);
-          if (c) candidates.push(c);
         }
       }
 
@@ -614,7 +582,7 @@ async function autoCaptureLoop(state) {
       const cur2 = pending.get(state);
       if (cur2) cur2.lastError = err.message || String(err);
     }
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 2500));
   }
 
   const cur = pending.get(state);
@@ -636,10 +604,6 @@ export function startBrowserOAuth({
   auto = true,
 } = {}) {
   purgeStalePending();
-  const { before, savedCurrent } = snapshotCurrentIfNeeded({ saveCurrentAs, skipSaveCurrent });
-
-  // Do NOT clearLiveAuth here — a failed Google authorize must not wipe the working session.
-  // finishBrowserOAuth overwrites WinCred only after a successful token exchange.
 
   const { client_id } = resolveOauthClient();
   const { verifier, challenge } = makePkce();
@@ -661,7 +625,7 @@ export function startBrowserOAuth({
     verifier,
     challenge,
     createdAt: Date.now(),
-    beforeEmail: before.email || null,
+    beforeEmail: null,
     status: "pending",
     error: null,
     result: null,
@@ -673,9 +637,20 @@ export function startBrowserOAuth({
   };
   pending.set(state, session);
 
-  if (open) {
-    openInExistingChrome(url.toString());
-    session.status = "browser_opened";
+  // Run snapshotting, browser opening, and auto-capture in the background without blocking the HTTP response
+  setImmediate(() => {
+    try {
+      const { before } = snapshotCurrentIfNeeded({ saveCurrentAs, skipSaveCurrent });
+      session.beforeEmail = before?.email || null;
+    } catch { /* ignore */ }
+
+    if (open) {
+      session.status = "browser_opened";
+      try {
+        openInExistingChrome(url.toString());
+      } catch { /* ignore */ }
+    }
+
     if (auto) {
       autoCaptureLoop(state).catch((err) => {
         const cur = pending.get(state);
@@ -687,15 +662,13 @@ export function startBrowserOAuth({
     } else {
       session.status = "waiting_auth";
     }
-  }
+  });
 
   return {
     ok: true,
     state,
     authUrl: url.toString(),
     redirectUri: REDIRECT_URI,
-    savedCurrent,
-    beforeEmail: before.email || null,
     auto: Boolean(auto),
     hint: "",
   };
@@ -738,7 +711,8 @@ export async function finishBrowserOAuth({ state, code, name } = {}) {
   if (!code || typeof code !== "string") {
     throw Object.assign(new Error("code required"), { code: "BAD_REQUEST" });
   }
-  const cleaned = code.trim().replace(/\s+/g, "");
+  const extracted = extractCodeFromText(code);
+  const cleaned = (extracted || code).trim().replace(/\s+/g, "");
   if (!cleaned) throw Object.assign(new Error("empty code"), { code: "BAD_REQUEST" });
 
   purgeStalePending();
@@ -787,12 +761,20 @@ export async function finishBrowserOAuth({ state, code, name } = {}) {
   const blobB64 = Buffer.from(JSON.stringify(blobObj), "utf8").toString("base64");
   writeWinCredBlob(blobB64);
   syncLiveOAuthFilesFromWinCred();
+  invalidateWhoamiCache();
 
-  const w = whoami();
+  const emailFromToken = decodeJwtEmail(data.id_token);
+  const w = whoami(true);
+  const effectiveEmail = emailFromToken || w.email;
+
+  const existingWithSameEmail = effectiveEmail
+    ? listProfiles().find((p) => p.email && p.email.toLowerCase() === effectiveEmail.toLowerCase())
+    : null;
   const profileName =
     (name && String(name).trim()) ||
-    w.suggestedName ||
-    (w.email ? w.email.split("@")[0] : "account");
+    (existingWithSameEmail ? existingWithSameEmail.name : null) ||
+    suggestProfileName(effectiveEmail) ||
+    (effectiveEmail ? effectiveEmail.split("@")[0] : "account");
 
   const saved = saveAccount(profileName);
   session.status = "done";

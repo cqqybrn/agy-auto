@@ -39,7 +39,6 @@
     zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
     layers: '<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>',
     paperclip: '<path d="m21.4 11.6-8.8 8.8a5 5 0 0 1-7.1-7.1l9.2-9.2a3.2 3.2 0 0 1 4.5 4.5l-9.2 9.2a1.4 1.4 0 0 1-2-2l8.1-8.1"/>',
-    image: '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.5"/><path d="m21 15-4.5-4.5L9 18"/>',
     key: '<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>',
     bulb: '<path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3z"/>',
     list: '<path d="M9 6h11M9 12h11M9 18h11M4.5 6h.01M4.5 12h.01M4.5 18h.01"/>',
@@ -54,6 +53,7 @@
     sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     moon: '<path d="M21 14.5A8.5 8.5 0 0 1 9.5 3a7 7 0 1 0 11.5 11.5z"/>',
     monitor: '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
+    brain: '<path d="M12 5a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0-2 2.8 3 3 0 0 0 1 2.8 3 3 0 0 0-1 2.9 3 3 0 0 0 2 2.8 3 3 0 0 0 3 2.7 3 3 0 0 0 3-2 3 3 0 0 0 3 2 3 3 0 0 0 3-2.7 3 3 0 0 0 2-2.8 3 3 0 0 0-1-2.9 3 3 0 0 0 1-2.8 3 3 0 0 0-2-2.8 3 3 0 0 0-3-3 3 3 0 0 0-3 3z"/><path d="M12 2v20"/>',
   };
 
   function iconHTML(name, cls = "") {
@@ -88,7 +88,7 @@
       }
     }
     for (const kid of kids.flat(Infinity)) {
-      if (kid == null || kid === false) continue;
+      if (kid == null || typeof kid === "boolean") continue;
       el.appendChild(typeof kid === "string" || typeof kid === "number" ? document.createTextNode(String(kid)) : kid);
     }
     return el;
@@ -110,6 +110,19 @@
   const uid = (p = "") => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
   const isImageExt = (ext) => /^(jpe?g|png|gif|webp|bmp|svg)$/i.test(String(ext || "").replace(/^\./, ""));
 
+  function cleanUserPrompt(raw) {
+    if (!raw || typeof raw !== "string") return "";
+    let s = raw.trim();
+    const m = s.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i);
+    if (m && m[1]) return m[1].trim();
+    return s
+      .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+      .replace(/<USER_SETTINGS_CHANGE>[\s\S]*?<\/USER_SETTINGS_CHANGE>/gi, "")
+      .replace(/<CONTEXT_SUMMARY>[\s\S]*?<\/CONTEXT_SUMMARY>/gi, "")
+      .replace(/<system_instructions>[\s\S]*?<\/system_instructions>/gi, "")
+      .trim();
+  }
+
   function fmtNum(n) {
     if (n == null || Number.isNaN(+n)) return "—";
     n = +n;
@@ -118,8 +131,8 @@
     return n.toLocaleString();
   }
   function fmtDur(ms) {
-    if (ms == null || ms < 0) return "";
-    const s = ms / 1000;
+    if (ms == null || ms < 0 || !Number.isFinite(+ms)) return "";
+    const s = +ms / 1000;
     if (s < 60) return `${s < 10 ? s.toFixed(1) : Math.round(s)}s`;
     const m = Math.floor(s / 60);
     if (m < 60) return `${m}m ${String(Math.floor(s % 60)).padStart(2, "0")}s`;
@@ -206,7 +219,6 @@
     const s = String(en || "").trim();
     if (!s) return "";
     const map = [
-      [/^listing\b/i, "列出"],
       [/^list(ing)?\b/i, "列出"],
       [/^analyz(?:ing|e|ed)?\b/i, "分析"],
       [/^read(ing)?\b/i, "读取"],
@@ -311,17 +323,6 @@
     if (obj.args != null) return obj.args;
     if (obj.arguments != null) return obj.arguments;
     if (obj.input != null) return obj.input;
-    if (
-      obj.CommandLine != null ||
-      obj.toolAction != null ||
-      obj.ToolAction != null ||
-      obj.AbsolutePath != null ||
-      obj.DirectoryPath != null ||
-      obj.TargetFile != null ||
-      obj.Path != null
-    ) {
-      return obj;
-    }
     return obj;
   }
 
@@ -541,8 +542,11 @@
     connected: false,
     models: [],
     prefs: {},
-    usage: null,
+    usage: LS.get("agy.usage", null),
     usageErr: null,
+    usageLoading: false,
+    accountQuotas: LS.get("agy.accountQuotas", {}) || {},
+    accountQuotasLoading: false,
     runs: [],
     model: LS.get("agy.model", null) || null,
     cwd: LS.get("agy.cwd", "") || "",
@@ -561,12 +565,15 @@
   };
 
   function normPath(p) {
-    return String(p || "").replace(/\//g, "\\").replace(/[\\/]+$/, "").toLowerCase();
+    const s = String(p || "").trim();
+    if (!s) return "";
+    const clean = s.replace(/\//g, "\\");
+    return (clean.length > 1 ? clean.replace(/[\\/]+$/, "") : clean).toLowerCase();
   }
   function convCwd(c) {
     if (!c) return "";
     if (c.cwd) return String(c.cwd).trim();
-    const fromTurn = (c.turns || []).map((t) => t.cwd).find(Boolean);
+    const fromTurn = (c.turns || []).map((t) => t?.cwd).find(Boolean);
     return fromTurn ? String(fromTurn).trim() : "";
   }
   function projectKey(p) {
@@ -582,19 +589,21 @@
     const arr = LS.get("agy.convs", []);
     if (!Array.isArray(arr)) return [];
     for (const c of arr) {
+      if (!c || typeof c !== "object") continue;
       if (!Array.isArray(c.queue)) c.queue = [];
       if (!c.cwd) {
-        const inferred = (c.turns || []).map((t) => t.cwd).find(Boolean);
+        const inferred = (c.turns || []).map((t) => t?.cwd).find(Boolean);
         if (inferred) c.cwd = inferred;
       }
       for (const t of c.turns || []) {
+        if (!t || typeof t !== "object") continue;
         if (t.status === "running") {
           t.status = "aborted";
           t.endedAt = t.endedAt || t.startedAt;
           t.blocks = t.blocks || [];
           t.blocks.push({ kind: "system", key: uid("s"), text: "页面刷新或关闭，本次运行已中断。" });
         }
-        for (const b of t.blocks || []) if (b.state === "running") b.state = "stopped";
+        for (const b of t.blocks || []) if (b && b.state === "running") b.state = "stopped";
       }
     }
     return arr;
@@ -759,14 +768,7 @@
 
     try { await loadRuns(); } catch { /* ignore */ }
     const owners = listRunningOwners();
-    if (owners.length === 1 && state.live.has(owners[0].conv.id)) {
-      selectConv(owners[0].conv.id);
-      closeRunsPop();
-      setTimeout(scrollBottom, 40);
-      return;
-    }
     if (owners.length === 1) {
-      // Found by saved runId after refresh — open chat, but stream already dead
       selectConv(owners[0].conv.id);
       closeRunsPop();
       setTimeout(scrollBottom, 40);
@@ -814,6 +816,7 @@
 
   function bucketPct(b) {
     if (!b) return null;
+    if (b.disabled) return 0;
     if (b.remainingPercent != null) return +b.remainingPercent;
     if (b.remainingFraction != null) return Math.round(b.remainingFraction * 1000) / 10;
     if (b.remaining_fraction != null) return Math.round(b.remaining_fraction * 1000) / 10;
@@ -957,7 +960,7 @@
     LS.set("agy.activeConv", id);
     const c = state.convs.find((x) => x.id === id);
     const cwd = convCwd(c);
-    if (cwd) applyCwd(cwd);
+    applyCwd(cwd || "");
     closePops();
     renderConvList();
     renderThread();
@@ -1035,7 +1038,7 @@
           const seg = segs[i];
           if (i === 0 && /^[A-Za-z]:$/.test(seg)) acc = seg + "\\";
           else acc = acc ? pathJoin(acc, seg) : seg;
-          parts.push({ label: seg.replace(/:$/, ":"), path: acc.endsWith("\\") ? acc : acc });
+          parts.push({ label: seg, path: acc });
         }
       }
       for (let i = 0; i < parts.length; i++) {
@@ -1150,9 +1153,12 @@
     const c = state.convs.find((x) => x.id === id);
     if (!c) return;
     const live = state.live.get(id);
+    const activeRunIdSet = new Set((state.runs || []).map((r) => r.run_id));
     const runIds = new Set();
     if (live?.runId) runIds.add(live.runId);
-    for (const t of c.turns || []) if (t.runId) runIds.add(t.runId);
+    for (const t of c.turns || []) {
+      if (t.runId && activeRunIdSet.has(t.runId)) runIds.add(t.runId);
+    }
 
     const convIds = new Set();
     if (c.conversationId) convIds.add(c.conversationId);
@@ -1176,6 +1182,7 @@
       try { await stopRun(id, true); } catch { /* ignore */ }
     }
     for (const rid of runIds) {
+      if (live?.runId === rid) continue;
       try {
         await api("/v1/agent/abort", { method: "POST", body: { run_id: rid }, timeoutMs: 8000 });
       } catch { /* ignore */ }
@@ -1205,9 +1212,7 @@
     renderThread();
     closeRunsPop();
     setTimeout(loadRuns, 400);
-    if (runIds.size || purged) {
-      toast(`对话已删除${runIds.size ? "，任务已停止" : ""}${purged ? `，清理 ${purged} 个文件` : ""}`);
-    }
+    toast(`对话已删除${runIds.size ? "，任务已停止" : ""}${purged ? `，清理 ${purged} 个文件` : ""}`);
   }
 
   // ==========================================================
@@ -1226,6 +1231,7 @@
     if (conv) {
       for (const t of conv.turns) threadInner.appendChild(renderTurn(conv, t));
       renderQueue(conv);
+      if (conv.conversationId) enrichTurnFromTranscript(conv);
     }
     renderTopbar();
     syncComposer();
@@ -1246,11 +1252,12 @@
   }
 
   function renderTurn(conv, turn) {
+    const cleanPrompt = cleanUserPrompt(turn.prompt);
     const uMeta = h("div", { class: "u-meta" },
       h("span", { text: fmtTime(turn.at) }),
       turn.cwd ? h("span", { class: "mono", title: turn.cwd, text: baseName(turn.cwd) }) : null,
-      h("button", { title: "复制", onclick: () => copyText(turn.prompt) }, icon("copy")),
-      h("button", { title: "编辑后重新发送", onclick: () => setPrompt(turn.prompt) }, icon("edit")),
+      h("button", { title: "复制", onclick: () => copyText(cleanPrompt) }, icon("copy")),
+      h("button", { title: "编辑后重新发送", onclick: () => setPrompt(cleanPrompt) }, icon("edit")),
     );
     const attachRow = (turn.attachments || []).length
       ? h("div", { class: "u-atts" }, turn.attachments.map((f) =>
@@ -1262,7 +1269,7 @@
     const blocks = h("div", { class: "a-blocks" });
     const foot = h("div", { class: "a-foot" });
     const root = h("article", { class: "turn" },
-      h("div", { class: "u-msg" }, attachRow, h("div", { class: "u-bubble", text: turn.prompt }), uMeta),
+      h("div", { class: "u-msg" }, attachRow, h("div", { class: "u-bubble", text: cleanPrompt }), uMeta),
       h("div", { class: "a-msg" }, head, blocks, foot),
     );
     const prevTx = turn._v?.tx;
@@ -1336,6 +1343,150 @@
     return b?.kind === "tool" || b?.kind === "subagent";
   }
 
+  function classifyTool(toolName, params) {
+    const n = String(toolName || "").toLowerCase();
+    const p = parseMaybeJSON(params);
+    const obj = p && typeof p === "object" ? p : {};
+    const action = String(pick(obj, ["toolAction", "ToolAction", "action"]) || "").toLowerCase();
+    const summary = String(pick(obj, ["toolSummary", "ToolSummary", "summary"]) || "").toLowerCase();
+    const cmd = String(pick(obj, ["CommandLine", "Command", "cmd"]) || "");
+    const meta = `${action} ${summary}`;
+
+    if (/invoke_subagent|define_subagent|manage_subagent|subagent/.test(n) || /subagent|子代理/.test(meta)) {
+      return "subagent";
+    }
+    if (/task|manage_task|task_boundary/.test(n) || /task|任务/.test(meta)) {
+      return "task";
+    }
+    if (/write_to_file|create_file|write_file|replace|multi_replace|edit|patch|sed_file/.test(n) ||
+        /write|edit|replace|patch|修改|创建|编辑|写入|删除|清理/.test(meta) ||
+        /Remove-Item|Clear-RecycleBin|rimraf|\brm\b|\bdel\b/i.test(cmd)) {
+      return "edit";
+    }
+    if (/grep|codebase_search|search_web|web_search|read_url|fetch|glob/.test(n) ||
+        /search|grep|find|query|搜索|查找|查询/.test(meta) ||
+        /Select-String|findstr|\bgrep\b/i.test(cmd)) {
+      return "search";
+    }
+    if (/view|read|list|outline|browse|cat|dir|find_by_name/.test(n) ||
+        /view|read|list|explore|inspect|scan|check|analyz|examin|查看|读取|探索|分析|浏览|列出|扫描|检查/.test(meta) ||
+        /Get-ChildItem|Get-PSDrive|Get-Item|Get-Content|\bdir\b|\bls\b|\btree\b|Measure-Object/i.test(cmd)) {
+      return "explored";
+    }
+    if (/run_command|^shell|bash|exec|terminal|command_status|send_command_input/.test(n) || /command|shell|exec|命令|终端|执行/.test(meta)) {
+      return "command";
+    }
+    return "other";
+  }
+
+  function aggregateStepStats(bucket) {
+    const stats = {
+      explored: 0,
+      search: 0,
+      command: 0,
+      edit: 0,
+      subagent: 0,
+      task: 0,
+      other: 0,
+      total: 0,
+    };
+    for (const b of bucket) {
+      if (!b) continue;
+      if (b.kind === "subagent") {
+        const count = (b.subagents && b.subagents.length) ? b.subagents.length : 1;
+        stats.subagent += count;
+        stats.total += count;
+        continue;
+      }
+      if (b.kind === "tool") {
+        const cat = classifyTool(b.name, b.params);
+        if (cat === "subagent") {
+          const subs = extractSubagentsFromToolBlock(b);
+          const count = subs.length ? subs.length : 1;
+          stats.subagent += count;
+          stats.total += count;
+          continue;
+        }
+        stats[cat] = (stats[cat] || 0) + 1;
+        stats.total += 1;
+        continue;
+      }
+      stats.total += 1;
+    }
+    return stats;
+  }
+
+  function renderStepPills(stats) {
+    const wrap = h("span", { class: "steps-stats" });
+    let renderedCount = 0;
+    if (stats.explored > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-explored", title: `${stats.explored} 次文件/目录探索` }, icon("eye"), `探索 ${stats.explored}`));
+      renderedCount++;
+    }
+    if (stats.search > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-search", title: `${stats.search} 次代码/网络搜索` }, icon("search"), `搜索 ${stats.search}`));
+      renderedCount++;
+    }
+    if (stats.command > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-command", title: `${stats.command} 条命令执行` }, icon("terminal"), `命令 ${stats.command}`));
+      renderedCount++;
+    }
+    if (stats.edit > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-edit", title: `${stats.edit} 处文件修改/创建` }, icon("pencil"), `修改 ${stats.edit}`));
+      renderedCount++;
+    }
+    if (stats.subagent > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-subagent", title: `${stats.subagent} 个子代理调度` }, icon("bot"), `子代理 ${stats.subagent}`));
+      renderedCount++;
+    }
+    if (stats.task > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-task", title: `${stats.task} 个任务操作` }, icon("list"), `任务 ${stats.task}`));
+      renderedCount++;
+    }
+    if (!renderedCount && stats.total > 0) {
+      wrap.appendChild(h("span", { class: "step-stat-badge pill-other" }, icon("tool"), `${stats.total} 步骤`));
+    }
+    return wrap;
+  }
+
+  function buildThinkingCard(turn) {
+    const thoughts = turn.thoughts || (turn.thinking ? [{ thinking: turn.thinking }] : []);
+    if (!thoughts.length) return null;
+    const isRunning = turn.status === "running";
+    const open = turn._thinkOpen != null ? !!turn._thinkOpen : true;
+    const firstPreview = oneLine(thoughts[0].thinking || "", 120);
+
+    const summary = h("summary", {
+      class: "think-summary",
+      title: "点击展开/收起思考过程",
+    },
+      h("span", { class: "think-ico" }, icon("brain")),
+      h("span", { class: "think-title", text: isRunning ? "思考中…" : "思考过程" }),
+      thoughts.length > 1 ? h("span", { class: "think-badge", text: `${thoughts.length} 阶段` }) : null,
+      turn.usage?.thinking_tokens ? h("span", { class: "think-badge", title: "thinking tokens", text: `${fmtNum(turn.usage.thinking_tokens)} think` }) : null,
+      h("span", { class: "think-prev", text: firstPreview }),
+      h("span", { class: "think-chev" }, icon("chevRight")),
+    );
+
+    const body = h("div", { class: "think-body md" });
+    if (thoughts.length === 1) {
+      body.innerHTML = md(thoughts[0].thinking || "");
+    } else {
+      thoughts.forEach((th, idx) => {
+        const phHead = h("div", { class: "think-phase-title", text: `第 ${idx + 1} 阶段思考` + (th.step_index != null ? ` · Step #${th.step_index}` : "") });
+        const phBody = h("div", { html: md(th.thinking || "") });
+        body.append(phHead, phBody);
+      });
+    }
+
+    const card = h("details", { class: "think-card" }, summary, body);
+    if (open) card.open = true;
+    card.addEventListener("toggle", () => {
+      turn._thinkOpen = card.open;
+    });
+    return card;
+  }
+
   /** Rebuild block list: tool/subagent rows live in a collapsible group that auto-closes when the turn finishes. */
   function paintAllBlocks(turn) {
     if (!turn._v) return;
@@ -1345,9 +1496,13 @@
     let mainBucket = [];
     let noiseBucket = [];
 
+    // Thinking process card displayed prominently at the top
+    const thinkCard = buildThinkingCard(turn);
+    if (thinkCard) frag.appendChild(thinkCard);
+
     const makeGroup = (bucket, { noise = false } = {}) => {
       if (!bucket.length) return;
-      const n = bucket.length;
+      const stats = aggregateStepStats(bucket);
       const busy = turn.status === "running" || bucket.some((b) => b.state === "running");
       const key = noise ? "_noiseOpen" : "_stepsOpen";
       if (turn[key] == null) turn[key] = noise ? false : busy;
@@ -1359,9 +1514,25 @@
         body.appendChild(el);
       }
       if (!open) body.classList.add("hidden");
-      const label = noise
-        ? (open ? `调试探测 · ${n}` : `另有 ${n} 条调试步骤`)
-        : (busy ? `执行中 · ${n} 个步骤` : `已完成 ${n} 个步骤`);
+
+      let toggleKids;
+      if (noise) {
+        toggleKids = [
+          h("span", { class: "bt-chev" }, icon("chevRight")),
+          h("span", { class: "steps-label", text: open ? `调试探测 · ${stats.total}` : `另有 ${stats.total} 条调试步骤` }),
+          h("span", { class: "steps-hint", text: open ? "点击收起" : "点击展开" }),
+        ];
+      } else {
+        const pillsWrap = renderStepPills(stats);
+        toggleKids = [
+          h("span", { class: "bt-chev" }, icon("chevRight")),
+          busy ? h("span", { class: "spin", style: "margin-right:2px" }) : h("span", { class: "bt-state ok", style: "margin-right:2px" }, icon("check")),
+          h("span", { class: "steps-label", text: busy ? "执行中" : "已完成" }),
+          pillsWrap,
+          h("span", { class: "steps-hint", text: open ? "点击收起" : "点击展开" }),
+        ];
+      }
+
       const wrap = h("div", { class: "steps-group" + (open ? " open" : "") + (noise ? " noise" : "") },
         h("button", {
           class: "steps-toggle",
@@ -1371,11 +1542,7 @@
             turn[key] = !turn[key];
             paintAllBlocks(turn);
           },
-        },
-          h("span", { class: "bt-chev" }, icon("chevRight")),
-          h("span", { class: "steps-label", text: label }),
-          busy && !noise ? h("span", { class: "spin" }) : h("span", { class: "steps-hint", text: open ? "点击收起" : "点击展开" }),
-        ),
+        }, ...toggleKids),
         body,
       );
       frag.appendChild(wrap);
@@ -1454,7 +1621,53 @@
     if (stick) scrollBottom();
   }
 
+  function extractSubagentsFromToolBlock(b) {
+    if (Array.isArray(b?.subagents) && b.subagents.length) return b.subagents;
+    const p = parseMaybeJSON(b?.params);
+    const obj = p && typeof p === "object" ? p : {};
+    let raw = obj.Subagents ?? obj.subagents ?? obj.agents;
+    if (typeof raw === "string") raw = parseMaybeJSON(raw);
+    if (!Array.isArray(raw) || !raw.length) return [];
+    const subs = raw.map((sa) => ({
+      role: sa.Role || sa.role || sa.TypeName || sa.type_name || "subagent",
+      type_name: sa.TypeName || sa.type_name || sa.Type || sa.type,
+      initial_prompt: sa.Prompt || sa.prompt || sa.task || sa.Task,
+      model: sa.Model || sa.model,
+      workspace: sa.Workspace || sa.workspace,
+      conversation_id: sa.conversation_id || sa.conversationId || null,
+      transcript_id: sa.conversation_id || sa.conversationId || null,
+    }));
+    if (b?.output) {
+      const outText = typeof b.output === "string" ? b.output : JSON.stringify(b.output);
+      const matches = [...outText.matchAll(/"conversationId":\s*"([0-9a-f-]+)"/gi)];
+      if (matches.length) {
+        for (let i = 0; i < subs.length && i < matches.length; i++) {
+          if (!subs[i].conversation_id) {
+            subs[i].conversation_id = matches[i][1];
+            subs[i].transcript_id = matches[i][1];
+          }
+        }
+      } else {
+        const uuids = [...outText.matchAll(/\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi)];
+        for (let i = 0; i < subs.length && i < uuids.length; i++) {
+          if (!subs[i].conversation_id) {
+            subs[i].conversation_id = uuids[i][1];
+            subs[i].transcript_id = uuids[i][1];
+          }
+        }
+      }
+    }
+    return subs;
+  }
+
   function buildBlock(turn, b) {
+    if (b.kind === "subagent" || (b.kind === "tool" && b.name === "invoke_subagent")) {
+      const subs = extractSubagentsFromToolBlock(b);
+      if (subs.length > 0) {
+        b.subagents = subs;
+        return buildSubagent(turn, b);
+      }
+    }
     switch (b.kind) {
       case "text":
         return h("div", { class: "blk-text" }, h("div", { class: "md", html: md(b.text) }));
@@ -1540,7 +1753,14 @@
       return { icon: "globe", phrase: lab.phrase, verb: lab.verb, target: lab.target };
     }
     if (/invoke_subagent|define_subagent|manage_subagents/.test(n)) {
-      const lab = humanToolPhrase(meta, "子代理", pick(obj, ["Role", "Name", "Prompt"]));
+      const subs = extractSubagentsFromToolBlock({ name, params });
+      let phrase = null;
+      if (subs.length > 1) {
+        phrase = `调度 ${subs.length} 个子代理：${subs.map((s) => s.role || s.type_name).join(" · ")}`;
+      } else if (subs.length === 1) {
+        phrase = `调度子代理：${subs[0].role || subs[0].type_name}`;
+      }
+      const lab = humanToolPhrase(meta, phrase || "子代理", pick(obj, ["Role", "Name", "Prompt"]));
       return { icon: "bot", phrase: lab.phrase, verb: lab.verb, target: lab.target };
     }
     if (/manage_task/.test(n)) {
@@ -1631,14 +1851,16 @@
     if (!subs.length) el.appendChild(h("div", { class: "bs-item" }, h("div", { class: "bs-prompt", text: "等待子代理信息…" })));
     for (const sa of subs) {
       const id = sa.transcript_id || sa.conversation_id;
-      const tx = id ? turn._v?.tx.get(id) : null;
-      const promptEl = sa.initial_prompt ? h("div", { class: "bs-prompt", title: "点击展开", text: sa.initial_prompt }) : null;
+      const tx = id ? turn._v?.tx?.get(id) : null;
+      const promptText = sa.initial_prompt || sa.prompt || sa.task || sa.Prompt || null;
+      const promptEl = promptText ? h("div", { class: "bs-prompt", title: "点击展开完整提示词", text: promptText }) : null;
       if (promptEl) promptEl.onclick = () => promptEl.classList.toggle("full");
       const txBtn = id ? h("button", { class: "btn sm", onclick: () => toggleTranscript(turn, id, txBtn) },
         icon("bulb"), tx?.open ? "收起思考与步骤" : "查看思考与步骤") : null;
       const item = h("div", { class: "bs-item" },
         h("div", { class: "bs-role" }, sa.role || sa.type_name || "subagent",
-          sa.type_name && sa.type_name !== sa.role ? h("span", { class: "tag", text: sa.type_name }) : null),
+          sa.type_name && sa.type_name !== sa.role ? h("span", { class: "tag", text: sa.type_name }) : null,
+          sa.model ? h("span", { class: "tag dim", text: sa.model }) : null),
         promptEl,
         h("div", { class: "bs-actions" },
           txBtn,
@@ -1646,7 +1868,7 @@
           id ? h("span", { class: "tag mono", style: "cursor:pointer", title: `${id}（点击复制）`, onclick: () => copyText(id, "已复制子代理 conversation_id") }, `#${shortId(id)}`) : null,
         ),
       );
-      if (id) {
+      if (id && turn._v?.tx) {
         const txState = turn._v.tx.get(id) || { open: false, el: h("div", { class: "bs-tx hidden" }), timer: null, openKeys: new Set() };
         turn._v.tx.set(id, txState);
         item.appendChild(txState.el);
@@ -1686,9 +1908,25 @@
     const steps = data.steps || [];
     const wrap = h("div", { class: "tx" });
     const thinkCount = steps.filter((s) => s.thinking).length;
+
+    const allCalls = [];
+    steps.forEach((s) => {
+      const calls = Array.isArray(s.tool_calls) ? s.tool_calls : s.tool_calls ? [s.tool_calls] : [];
+      calls.forEach((c) => {
+        allCalls.push({
+          kind: "tool",
+          name: c?.name || c?.tool_name || c?.function?.name || "tool",
+          params: c?.args ?? c?.arguments ?? c?.parameters ?? c?.function?.arguments ?? c?.input,
+        });
+      });
+    });
+    const subStats = aggregateStepStats(allCalls);
+    const pillsWrap = renderStepPills(subStats);
+
     wrap.appendChild(h("div", { class: "tx-meta" },
       h("span", { text: `${steps.length} steps` }),
-      thinkCount ? h("span", { class: "tag violet" }, icon("bulb"), `${thinkCount} thoughts`) : null,
+      thinkCount ? h("span", { class: "tag violet" }, icon("brain"), `${thinkCount} thoughts`) : null,
+      pillsWrap,
       data.path ? h("span", { class: "mono", title: data.path, text: baseName(data.path) === "transcript.jsonl" ? `…/${shortId(data.conversation_id)}/transcript.jsonl` : data.path }) : null,
     ));
     if (!steps.length) {
@@ -1708,8 +1946,8 @@
       ));
       if (s.thinking) {
         const d = h("details", { class: "tx-think", "data-k": `t${k}` },
-          h("summary", {}, icon("bulb"), h("span", { text: "Thought" }), h("span", { class: "prev", text: oneLine(s.thinking, 140) })),
-          h("div", { class: "think-body", text: s.thinking }));
+          h("summary", {}, icon("brain"), h("span", { text: "Thought" }), h("span", { class: "prev", text: oneLine(s.thinking, 140) })),
+          h("div", { class: "think-body md", html: md(s.thinking) }));
         if (openKeys.has(`t${k}`)) d.open = true;
         step.appendChild(d);
       }
@@ -1766,7 +2004,7 @@
     const parts = [];
     if (u.input_tokens != null) parts.push(h("span", { class: "mono", title: "input tokens" }, `↑ ${fmtNum(u.input_tokens)}`));
     if (u.output_tokens != null) parts.push(h("span", { class: "mono", title: "output tokens" }, `↓ ${fmtNum(u.output_tokens)}`));
-    if (u.thinking_tokens) parts.push(h("span", { class: "mono", title: "thinking tokens（CLI 不提供主代理思考文本，仅统计数量；子代理思考见 transcript）" }, `✦ ${fmtNum(u.thinking_tokens)} think`));
+    if (u.thinking_tokens) parts.push(h("span", { class: "mono", style: "cursor:pointer", title: "点击展开/收起思考过程", onclick: () => { turn._thinkOpen = !turn._thinkOpen; paintAllBlocks(turn); } }, `✦ ${fmtNum(u.thinking_tokens)} think`));
     if (u.cache_read_tokens) parts.push(h("span", { class: "mono", title: "cache read tokens" }, `⟲ ${fmtNum(u.cache_read_tokens)} cached`));
     const text = turn.blocks.filter((b) => b.kind === "text").map((b) => b.text).join("\n\n") || turn.response || "";
     const items = [];
@@ -1829,10 +2067,16 @@
     input.setSelectionRange(input.value.length, input.value.length);
   }
 
-  async function send(promptOverride) {
+  async function send(promptOverride, attachmentsOverride) {
+    if (promptOverride == null && state.attachments.some((f) => f.uploading)) {
+      toast("文件正在上传中，请稍候…");
+      return;
+    }
     const input = $("#promptInput");
     const text = (promptOverride ?? input.value).trim();
-    const files = promptOverride != null ? [] : state.attachments.filter((f) => f.path && !f.uploading);
+    const files = attachmentsOverride != null
+      ? attachmentsOverride
+      : (promptOverride != null ? [] : state.attachments.filter((f) => f.path && !f.uploading));
     if (!text && !files.length) return;
     const prompt = text || (files.length ? "请分析我附上的这些文件。" : "");
     const agentPrompt = buildPromptWithAttachments(prompt, files);
@@ -2003,6 +2247,31 @@
         if (d.conversation_id) setConversationId(conv, d.conversation_id);
         if (d.model && !turn.model) turn.model = d.model;
         break;
+      case "thinking": {
+        const text = d.thinking || d.text_delta || "";
+        if (!text) break;
+        if (!turn.thoughts) turn.thoughts = [];
+        let cur = turn.thoughts[turn.thoughts.length - 1];
+        if (!cur || (si != null && cur.step_index !== si)) {
+          cur = { step_index: si, thinking: "" };
+          turn.thoughts.push(cur);
+        }
+        cur.thinking += text;
+        turn.thinking = turn.thoughts.map((x) => x.thinking).join("\n\n---\n\n");
+        schedulePaint(turn, null, true);
+        break;
+      }
+      case "step": {
+        if (d.thinking) {
+          if (!turn.thoughts) turn.thoughts = [];
+          if (!turn.thoughts.some((th) => th.thinking === d.thinking)) {
+            turn.thoughts.push({ step_index: si, thinking: d.thinking });
+            turn.thinking = turn.thoughts.map((x) => x.thinking).join("\n\n---\n\n");
+            schedulePaint(turn, null, true);
+          }
+        }
+        break;
+      }
       case "text_delta": {
         const last = turn.blocks[turn.blocks.length - 1];
         const key = si != null ? `t${si}` : last?.kind === "text" ? last.key : uid("t");
@@ -2016,6 +2285,13 @@
       }
       case "tool": {
         const info = d.tool_info || {};
+        if (d.thinking) {
+          if (!turn.thoughts) turn.thoughts = [];
+          if (!turn.thoughts.some((th) => th.thinking === d.thinking)) {
+            turn.thoughts.push({ step_index: si, thinking: d.thinking });
+            turn.thinking = turn.thoughts.map((x) => x.thinking).join("\n\n---\n\n");
+          }
+        }
         upsertBlock(turn, si != null ? `x${si}` : uid("x"), "tool", (b) => {
           b.name = d.tool_name || info.name || b.name;
           const params = extractToolParams(info);
@@ -2096,6 +2372,122 @@
     if (conv.id === state.activeId) renderTopbar();
   }
 
+  const transcriptLoadingSet = new Set();
+  async function enrichTurnFromTranscript(conv, targetTurn) {
+    const cid = conv?.conversationId;
+    if (!cid || transcriptLoadingSet.has(cid)) return;
+    transcriptLoadingSet.add(cid);
+    try {
+      const data = await api(`/v1/transcripts/${encodeURIComponent(cid)}?limit=1500`, { timeoutMs: 12000 });
+      if (!data?.ok || !Array.isArray(data.steps)) return;
+
+      const turns = conv.turns || [];
+      if (!turns.length) return;
+
+      // Group transcript steps by USER_INPUT
+      const partitions = [];
+      let cur = [];
+      for (const s of data.steps) {
+        if (/user_input|user/i.test(`${s.type || ""} ${s.source || ""}`)) {
+          if (cur.length > 0) partitions.push(cur);
+          cur = [s];
+        } else {
+          cur.push(s);
+        }
+      }
+      if (cur.length > 0) partitions.push(cur);
+
+      let updated = false;
+      for (let i = 0; i < turns.length; i++) {
+        const t = turns[i];
+        if (targetTurn && t !== targetTurn && (t.thoughts || t.thinking)) continue;
+        const part = partitions[i] || (i === turns.length - 1 ? partitions[partitions.length - 1] : null);
+        if (!part) continue;
+
+        const thoughts = [];
+        for (const s of part) {
+          if (s.thinking && typeof s.thinking === "string" && s.thinking.trim()) {
+            thoughts.push({ step_index: s.step_index, thinking: s.thinking.trim(), created_at: s.created_at });
+          }
+        }
+
+        if (thoughts.length > 0) {
+          t.thoughts = thoughts;
+          t.thinking = thoughts.map((x) => x.thinking).join("\n\n---\n\n");
+          if (attached(t)) paintAllBlocks(t);
+          updated = true;
+        }
+
+        // Clean XML tags from turn prompt if present
+        if (t.prompt && /<USER_REQUEST>|<USER_SETTINGS_CHANGE>|<ADDITIONAL_METADATA>/i.test(t.prompt)) {
+          const cleaned = cleanUserPrompt(t.prompt);
+          if (cleaned && cleaned !== t.prompt) {
+            t.prompt = cleaned;
+            updated = true;
+          }
+        }
+
+        // Restore complete tool blocks if missing or incomplete
+        const partTools = [];
+        for (let idx = 0; idx < part.length; idx++) {
+          const s = part[idx];
+          if (s.tool_calls) {
+            const nextStep = part[idx + 1];
+            const output = nextStep && (nextStep.type === "GENERIC" || nextStep.type === "TOOL_OUTPUT" || nextStep.source === "MODEL") ? nextStep.content : null;
+            for (const tc of (Array.isArray(s.tool_calls) ? s.tool_calls : [s.tool_calls])) {
+              const toolName = tc.name || tc.tool_name || tc.function?.name || "tool";
+              const rawParams = tc.args ?? tc.arguments ?? tc.parameters ?? tc.input;
+              const pt = {
+                kind: toolName === "invoke_subagent" ? "subagent" : "tool",
+                key: `tx-${s.step_index}`,
+                name: toolName,
+                params: rawParams,
+                output: output,
+                state: "done",
+              };
+              if (toolName === "invoke_subagent") {
+                pt.subagents = extractSubagentsFromToolBlock(pt);
+              }
+              partTools.push(pt);
+            }
+          }
+        }
+        if (partTools.length > 0) {
+          const nonTools = (t.blocks || []).filter((b) => b.kind !== "tool" && b.kind !== "subagent");
+          const existingTools = (t.blocks || []).filter((b) => b.kind === "tool" || b.kind === "subagent");
+          const needReplace =
+            existingTools.length < partTools.length ||
+            existingTools.some(
+              (b) =>
+                !b.params ||
+                (b.name === "invoke_subagent" && (!b.subagents || !b.subagents.length))
+            );
+          if (needReplace) {
+            t.blocks = [...partTools, ...nonTools];
+            if (attached(t)) paintAllBlocks(t);
+            updated = true;
+          }
+        }
+
+        // Restore response text if missing
+        if (!t.blocks?.some((b) => b.kind === "text")) {
+          const lastModel = [...part].reverse().find((s) => s.content && typeof s.content === "string");
+          if (lastModel?.content) {
+            if (!t.blocks) t.blocks = [];
+            t.blocks.push({ kind: "text", key: "final-tx", text: lastModel.content });
+            if (attached(t)) paintAllBlocks(t);
+            updated = true;
+          }
+        }
+      }
+      if (updated) scheduleSave();
+    } catch {
+      // Non-fatal background fetch
+    } finally {
+      transcriptLoadingSet.delete(cid);
+    }
+  }
+
   function finishTurn(conv, turn, status, err) {
     if (turn.status !== "running") return;
     turn.status = status;
@@ -2131,6 +2523,7 @@
       }
       if (stick) scrollBottom();
     }
+    if (conv.conversationId) enrichTurnFromTranscript(conv, turn);
     renderConvList();
     syncComposer();
     saveNow();
@@ -2186,7 +2579,7 @@
   function retryTurn(conv, turn) {
     if (!conv || isLive(conv)) return;
     if (conv.id !== state.activeId) selectConv(conv.id);
-    send(turn.prompt);
+    send(turn.prompt, turn.attachments);
   }
 
   // ==========================================================
@@ -2278,6 +2671,10 @@
         toast(`不支持的类型：${file.name}`, true);
         continue;
       }
+      if (file.size === 0) {
+        toast(`文件为空：${file.name}`, true);
+        continue;
+      }
       if (file.size > ATTACH_MAX_BYTES) {
         toast(`文件过大（≤25MB）：${file.name}`, true);
         continue;
@@ -2351,7 +2748,6 @@
       btn.dataset.mode = live ? "queue" : "send";
       btn.appendChild(icon("arrowUp"));
     }
-    promptInput.placeholder = "";
     promptInput.disabled = false;
     const ab = $("#attachBtn");
     if (ab) ab.disabled = false;
@@ -2378,8 +2774,9 @@
       $(`#${id}`).classList.add("hidden");
       $(`#${POP_CHIP[id]}`).classList.remove("on");
     }
+    closeRunsPop();
   }
-  const popOpen = () => POPS.some((id) => !$(`#${id}`).classList.contains("hidden"));
+  const popOpen = () => POPS.some((id) => !$(`#${id}`).classList.contains("hidden")) || !$("#runsPop")?.classList.contains("hidden");
 
   // model
   function renderModelChip() {
@@ -2429,7 +2826,7 @@
       const qs = quotaForGroup(g);
       const reset = qs ? bucketResetSecs(qs.bucket) : null;
       list.appendChild(h("div", { class: "pop-title" }, h("span", { text: g }),
-        qs ? h("span", { class: `q ${levelClass(qs.pct)}`, title: reset != null ? `resets in ${fmtSecs(reset)}` : "" }, qs.pct <= 0 ? `额度耗尽 · ${fmtSecs(reset)}` : `${qs.pct}% left`) : null));
+        qs ? h("span", { class: `q ${levelClass(qs.pct)}`, title: reset != null ? `resets in ${fmtSecs(reset)}` : "" }, qs.pct <= 0 ? (reset != null ? `额度耗尽 · ${fmtSecs(reset)}` : "额度耗尽") : `${qs.pct}% left`) : null));
       for (const m of groups.get(g)) {
         const isDef = m.id === state.prefs.defaultModel;
         const star = h("span", { class: "pi-star" + (isDef ? " on" : ""), role: "button", title: isDef ? "当前服务器默认模型" : "设为服务器默认模型" }, icon("star"));
@@ -2462,7 +2859,8 @@
     state.cwd = (val || "").trim();
     LS.set("agy.cwd", state.cwd);
     if (state.cwd) {
-      state.recentCwds = [state.cwd, ...state.recentCwds.filter((x) => x !== state.cwd)].slice(0, 8);
+      const rec = Array.isArray(state.recentCwds) ? state.recentCwds : [];
+      state.recentCwds = [state.cwd, ...rec.filter((x) => x !== state.cwd)].slice(0, 8);
       LS.set("agy.recentCwds", state.recentCwds);
     }
     renderCwdChip();
@@ -2502,7 +2900,16 @@
             });
           },
         }, "浏览…"),
-        h("button", { class: "btn sm", title: "写入服务器 prefs.defaultCwd", onclick: () => { const v = input.value.trim(); if (!v) return toast("请输入路径", true); setServerPrefs({ defaultCwd: v }, "默认工作目录已保存"); applyCwd(""); closePops(); } }, "设为默认"),
+        h("button", {
+          class: "btn sm",
+          title: "写入服务器 prefs.defaultCwd",
+          onclick: async () => {
+            const v = input.value.trim();
+            if (!v) return toast("请输入路径", true);
+            const ok = await setServerPrefs({ defaultCwd: v }, "默认工作目录已保存");
+            if (ok) { applyCwd(""); closePops(); }
+          },
+        }, "设为默认"),
         state.cwd ? h("button", { class: "btn sm ghost", onclick: () => { applyCwd(""); const conv = activeConv(); if (conv) { conv.cwd = null; scheduleSave(); renderConvList(); } closePops(); } }, "清除") : null,
       )));
     if (state.recentCwds.length) {
@@ -2536,12 +2943,13 @@
       renderAccountChip(hl.account);
       renderCwdChip();
       renderModelChip();
+      renderQMeter();
       if (wasDown) {
         loadModels();
-        loadUsage(true);
+        if (!state.usageLoading) loadUsage(false);
         loadCaps();
         loadRuns();
-      } else if (!state.usage && !state.usageErr) {
+      } else if (!state.usage && !state.usageErr && !state.usageLoading) {
         loadUsage(false);
       }
     } catch (err) {
@@ -2549,6 +2957,7 @@
       $("#connDot").className = "conn-dot err";
       $("#connText").textContent = err.status === 401 ? "API Key 无效" : "后端未连接";
       renderModelChip();
+      renderQMeter();
     }
     $("#connUrl").textContent = baseUrl().replace(/^https?:\/\//, "");
   }
@@ -2571,6 +2980,7 @@
     }
     renderModelChip();
     if (!$("#modelPop").classList.contains("hidden")) renderModelPop();
+    if (state.drawer === "settings") renderSettings();
   }
 
   async function setServerPrefs(patch, okMsg) {
@@ -2611,13 +3021,20 @@
   // ==========================================================
   // Quota
   // ==========================================================
-  async function loadUsage(force) {
-    if (state.drawer === "quota" && force) $("#quotaBody").replaceChildren(h("div", { class: "loading-line" }, h("span", { class: "spin" }), "刷新中…"));
+  async function loadUsage(force = false) {
+    state.usageLoading = true;
+    renderQMeter();
+    if (state.drawer === "quota" && force) {
+      $("#quotaBody").replaceChildren(h("div", { class: "loading-line" }, h("span", { class: "spin" }), "刷新中…"));
+    }
     try {
       state.usage = await api(`/v1/usage${force ? "?refresh=1" : ""}`, { timeoutMs: 60000 });
       state.usageErr = null;
+      if (state.usage?.panel) LS.set("agy.usage", state.usage);
     } catch (err) {
       state.usageErr = err.message;
+    } finally {
+      state.usageLoading = false;
     }
     renderQMeter();
     renderModelChip();
@@ -2629,22 +3046,31 @@
     btn.innerHTML = "";
     const groups = state.usage?.panel?.groups || [];
     if (!groups.length) {
-      const msg = state.usageErr ? `额度失败` : state.connected ? "加载额度…" : "Quotas";
+      if (state.usageLoading) {
+        btn.appendChild(h("span", { class: "qm-empty loading" }, h("span", { class: "spin" }), "刷新额度…"));
+        btn.title = "正在获取最新模型配额…";
+        return;
+      }
+      const msg = state.usageErr ? `额度失败` : "加载额度…";
       btn.appendChild(h("span", { class: "qm-empty" + (state.usageErr ? " qm-err" : ""), text: msg }));
       btn.title = state.usageErr ? `配额加载失败：${state.usageErr}` : "Model Quotas · 点击查看 Gemini / Claude·GPT 的 7d 与 5h 剩余";
       return;
     }
     const tips = [];
+    if (state.usageLoading) tips.push("【后台刷新中…】");
     for (const g of groups) {
       const weekly = pickBucket(g, "weekly");
       const five = pickBucket(g, "5h");
       const rows = [weekly, five].filter(Boolean);
       const rowEls = (rows.length ? rows : (g.buckets || [])).map((b) => {
         const pct = bucketPct(b);
+        const barPct = b.disabled ? 0 : (pct == null ? 0 : Math.max(2, Math.min(100, pct)));
+        const pctText = b.disabled ? "0%" : (pct == null ? "—" : `${Math.round(pct)}%`);
+        const cls = b.disabled ? "crit" : levelClass(pct);
         return h("div", { class: "qm-row" },
           h("span", { class: "qm-win", text: shortWin(b) }),
-          h("span", { class: "qm-bar" }, h("i", { class: levelClass(pct), style: `width:${pct == null ? 0 : Math.max(2, Math.min(100, pct))}%` })),
-          h("span", { class: "qm-pct", text: pct == null ? "—" : `${Math.round(pct)}%` }));
+          h("span", { class: "qm-bar" }, h("i", { class: cls, style: `width:${barPct}%` })),
+          h("span", { class: "qm-pct", text: pctText }));
       });
       btn.appendChild(h("span", { class: "qm" },
         h("span", { class: "qm-name", text: shortGroup(g.displayName) }),
@@ -2652,7 +3078,7 @@
       for (const b of (rows.length ? rows : g.buckets || [])) {
         const pct = bucketPct(b);
         const reset = bucketResetSecs(b);
-        tips.push(`${shortGroup(g.displayName)} ${shortWin(b)}: ${pct == null ? "—" : `${pct}%`}${reset != null ? ` · resets ${fmtSecs(reset)}` : ""}`);
+        tips.push(`${shortGroup(g.displayName)} ${shortWin(b)}: ${b.disabled ? "0% (已受周限)" : (pct == null ? "—" : `${pct}%`)}${reset != null ? ` · resets ${fmtSecs(reset)}` : ""}`);
       }
     }
     btn.title = tips.join("\n") || "Model Quotas";
@@ -2665,15 +3091,18 @@
     const rt = b.resetTime || b.reset_time;
     const winLabel = shortWin(b);
     const title = b.displayName || b.display_name || b.bucketId || winLabel;
+    const fillPct = b.disabled ? 0 : (pct == null ? 0 : Math.max(0, Math.min(100, pct)));
+    const pctText = b.disabled ? "0% (受限)" : (pct == null ? "—" : `${pct}%`);
     return h("div", { class: "q-bucket" + (b.disabled ? " disabled" : "") },
       h("div", { class: "qb-head" },
         h("span", {}, title, h("span", { class: "tag", style: "margin-left:8px", text: winLabel }),
-          b.disabled ? h("span", { class: "tag", style: "margin-left:8px", text: "受周额度限制" }) : null),
-        h("span", { class: "qb-pct", text: pct == null ? "—" : `${pct}%` })),
-      h("div", { class: "qb-bar" }, h("div", { class: `qb-fill ${levelClass(pct)}`, style: `width:${pct == null ? 0 : Math.max(0, Math.min(100, pct))}%` })),
+          b.disabled ? h("span", { class: "tag red", style: "margin-left:8px", text: "受周额度限制" }) : null),
+        h("span", { class: "qb-pct" + (b.disabled ? " crit" : ""), text: pctText })),
+      h("div", { class: "qb-bar" }, h("div", { class: `qb-fill ${levelClass(pct)}`, style: `width:${fillPct}%` })),
       h("div", { class: "qb-sub" },
         h("span", { text: resetIn ? `Resets in ${resetIn}` : "" }),
-        h("span", { text: rt ? fmtDateTime(rt) : "" })));
+        h("span", { text: rt ? fmtDateTime(rt) : "" })),
+      b.description ? h("div", { class: "qb-desc", text: b.description }) : null);
   }
 
   function renderQuota() {
@@ -2686,11 +3115,16 @@
       return;
     }
     $("#quotaTitle").textContent = data.panel?.title || "Model Quotas";
-    $("#quotaDesc").textContent = "";
+    $("#quotaDesc").textContent = data.panel?.description || "";
     const frag = document.createDocumentFragment();
     if (data.stale || state.usageErr) {
       frag.appendChild(h("div", { class: "blk-error", style: "margin-bottom:16px" }, icon("alert"),
         h("div", { class: "be-body", text: state.usageErr ? `刷新失败：${state.usageErr}` : "刷新失败，显示缓存" })));
+    }
+    if (data.is_apikey) {
+      frag.appendChild(h("div", { class: "card", style: "margin-bottom:16px" },
+        h("h3", {}, "Gemini API Key 模式"),
+        h("p", { class: "drawer-desc", text: "当前账号使用 Gemini API Key 模式，不消耗 Google Cloud Code 个人周配额。如需使用 Claude 或 Google 官方订阅配额，请切换至 OAuth 账号。" })));
     }
     const groups = data.panel?.groups || [];
     if (groups.length) {
@@ -2710,7 +3144,7 @@
         bucketId: id, displayName: q.display_name || id, remainingFraction: q.remaining_fraction,
         resetTime: q.reset_time, reset_in_seconds: q.reset_in_seconds, disabled: q.disabled,
       }))));
-    } else {
+    } else if (!data.is_apikey) {
       frag.appendChild(h("div", { class: "loading-line", text: "无配额数据" }));
     }
 
@@ -2767,9 +3201,10 @@
     phase: "",       // busy | ok | err
     text: "",
     state: null,
+    authUrl: null,
     btnLabel: "添加账号",
   };
-  let addUi = { status: null, btn: null };
+  let addUi = { status: null, btn: null, statusText: null };
 
   function renderAccountChip(account) {
     const email = account?.email || (account?.accountType ? `(${account.accountType})` : null);
@@ -2783,17 +3218,22 @@
   }
 
   function paintAddUi() {
-    const { status, btn } = addUi;
+    const { status, btn, statusText } = addUi;
     if (btn) {
       const busy = addFlow.phase === "busy";
       btn.disabled = busy;
       btn.classList.toggle("busy", busy);
-      btn.replaceChildren();
-      if (busy) btn.appendChild(h("span", { class: "spin" }));
-      else if (addFlow.phase === "ok") btn.appendChild(icon("check"));
-      else if (addFlow.phase === "err") btn.appendChild(icon("alert"));
-      else btn.appendChild(icon("plus"));
-      btn.appendChild(document.createTextNode(addFlow.btnLabel || "添加账号"));
+      if (btn.tagName === "BUTTON" && btn.id === "mainAddBtn") {
+        btn.replaceChildren();
+        if (busy) btn.appendChild(h("span", { class: "spin" }));
+        else if (addFlow.phase === "ok") btn.appendChild(icon("check"));
+        else if (addFlow.phase === "err") btn.appendChild(icon("alert"));
+        else btn.appendChild(icon("plus"));
+        btn.appendChild(document.createTextNode(addFlow.btnLabel || "添加账号 (Google OAuth)"));
+      }
+    }
+    if (statusText) {
+      statusText.textContent = addFlow.text || "等待授权…";
     }
     if (status) {
       status.className = "acct-add-status" + (addFlow.phase ? ` ${addFlow.phase}` : "");
@@ -2810,7 +3250,7 @@
   function setAddProgress(phase, text) {
     addFlow.phase = phase || "";
     addFlow.text = text || "";
-    addFlow.active = phase === "busy";
+    addFlow.active = phase === "busy" || Boolean(addFlow.authUrl);
     if (phase === "busy") addFlow.btnLabel = text || "添加中…";
     else if (phase === "ok") addFlow.btnLabel = "添加成功";
     else if (phase === "err") addFlow.btnLabel = "添加失败，重试";
@@ -2827,10 +3267,56 @@
     addFlow.phase = "";
     addFlow.text = "";
     addFlow.state = null;
+    addFlow.authUrl = null;
     addFlow.btnLabel = "添加账号";
   }
 
-  async function renderAccounts() {
+  async function submitManualOAuthCode(rawCode) {
+    if (!rawCode || !String(rawCode).trim()) {
+      toast("请先输入或粘贴授权码", true);
+      return;
+    }
+    const code = extractCodeFromClip(rawCode) || String(rawCode).trim();
+    if (!code) {
+      toast("未能提取到有效授权码", true);
+      return;
+    }
+    setAddProgress("busy", "正在保存账号…");
+    try {
+      const r = await api("/v1/accounts/oauth/finish", {
+        method: "POST",
+        body: { state: addFlow.state, code },
+        timeoutMs: 30000,
+      });
+      finishAddSuccess(r.email || r.name);
+    } catch (err) {
+      setAddProgress("err", `换票失败：${err.message}`);
+      toast(`换票失败：${err.message}`, true);
+      paintAddUi();
+    }
+  }
+
+  async function saveApiKeyAccount(name, apiKey) {
+    if (!name || !apiKey) {
+      toast("档案名和 API Key 均不能为空", true);
+      return;
+    }
+    setAddProgress("busy", "正在保存 API Key 账号…");
+    try {
+      const r = await api("/v1/accounts/save", {
+        method: "POST",
+        body: { name, type: "apikey", apiKey },
+        timeoutMs: 15000,
+      });
+      finishAddSuccess(r.name);
+    } catch (err) {
+      setAddProgress("err", `保存失败：${err.message}`);
+      toast(`保存失败：${err.message}`, true);
+      paintAddUi();
+    }
+  }
+
+  async function renderAccounts(force = false) {
     const body = $("#accountBody");
     const desc = $("#accountDesc");
     if (desc) desc.textContent = "";
@@ -2852,30 +3338,162 @@
         h("strong", { text: w.email || "未登录" }),
         w.activeProfile ? h("div", { class: "tags" }, h("span", { class: "tag blue", text: w.activeProfile })) : null)));
 
-    const status = h("div", { class: "acct-add-status" });
-    const addBtn = h("button", {
-      class: "btn primary",
-      type: "button",
-      style: "width:100%",
-      onclick: () => {
-        if (addFlow.phase === "busy") return;
-        beginBrowserOAuthFlow();
-      },
-    }, icon("plus"), "添加账号");
-    addUi = { status, btn: addBtn };
-    frag.appendChild(h("div", { class: "card acct-add" }, addBtn, status));
-    paintAddUi();
+    const addCard = h("div", { class: "card acct-add" });
+    if (addFlow.active) {
+      const busy = addFlow.phase === "busy";
+      const statusText = h("strong", { style: "font-size:13px", text: addFlow.text || "等待授权…" });
+      const head = h("div", { class: "row center", style: "justify-content:space-between; margin-bottom:6px" },
+        h("div", { class: "row gap-xs center" },
+          busy ? h("span", { class: "spin", style: "width:13px; height:13px" }) : (addFlow.phase === "ok" ? icon("check") : icon("alert")),
+          statusText
+        ),
+        h("button", {
+          class: "btn sm",
+          type: "button",
+          onclick: () => {
+            resetAddFlow();
+            renderAccounts();
+          },
+        }, "取消")
+      );
+
+      const hint = h("div", { class: "acct-add-hint", style: "margin:4px 0 8px; font-size:12px; line-height:1.5" },
+        "已发起 Google OAuth 授权。授权完成后，系统会自动捕获授权码。若未自动跳转，可直接复制授权码或回调网址粘贴至下方："
+      );
+
+      const actionRow = h("div", { class: "col gap-xs", style: "margin: 8px 0" },
+        addFlow.authUrl ? h("a", {
+          class: "btn primary",
+          href: addFlow.authUrl,
+          target: "_blank",
+          rel: "noopener noreferrer",
+          style: "width:100%; text-align:center; text-decoration:none; display:flex; align-items:center; justify-content:center; gap:6px",
+        }, icon("external-link"), "点击打开 Google 授权窗口") : null,
+        h("div", { class: "row gap-xs" },
+          addFlow.authUrl ? h("button", {
+            class: "btn sm grow",
+            type: "button",
+            onclick: () => {
+              copyText(addFlow.authUrl);
+              toast("已复制授权链接");
+            },
+          }, "复制授权链接") : null,
+          h("button", {
+            class: "btn sm",
+            type: "button",
+            onclick: () => {
+              resetAddFlow();
+              renderAccounts();
+            },
+          }, "取消")
+        )
+      );
+
+      const codeIn = h("input", {
+        class: "field mono grow",
+        type: "text",
+        placeholder: "在此粘贴授权码 (4/0A...) 或完整回调 URL",
+        autocomplete: "off",
+      });
+      codeIn.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          submitManualOAuthCode(codeIn.value);
+        }
+      });
+
+      const submitBtn = h("button", {
+        class: "btn primary sm",
+        type: "button",
+        onclick: () => submitManualOAuthCode(codeIn.value),
+      }, "提交");
+
+      const pasteBtn = h("button", {
+        class: "btn sm",
+        type: "button",
+        title: "直接读取剪贴板并提交",
+        onclick: async () => {
+          try {
+            if (navigator.clipboard?.readText) {
+              const txt = await navigator.clipboard.readText();
+              if (txt) {
+                codeIn.value = txt.trim();
+                submitManualOAuthCode(txt);
+                return;
+              }
+            }
+            toast("剪贴板为空或未授权读取，请在输入框直接按 Ctrl+V 粘贴", true);
+          } catch (err) {
+            toast(`无法读取剪贴板（${err.message}），请在输入框按 Ctrl+V 粘贴`, true);
+          }
+        },
+      }, "一键粘贴提交");
+
+      const inputRow = h("div", { class: "row gap-xs", style: "margin-bottom:6px" }, codeIn, submitBtn, pasteBtn);
+      const status = h("div", { class: "acct-add-status" + (addFlow.phase ? ` ${addFlow.phase}` : "") });
+      addUi = { status, btn: submitBtn, statusText };
+
+      addCard.append(head, hint, actionRow, inputRow, status);
+    } else {
+      const addBtn = h("button", {
+        id: "mainAddBtn",
+        class: "btn primary",
+        type: "button",
+        style: "width:100%",
+        onclick: () => {
+          if (addFlow.phase === "busy") return;
+          beginBrowserOAuthFlow();
+        },
+      }, icon("plus"), "添加账号 (Google OAuth)");
+
+      const status = h("div", { class: "acct-add-status" });
+      addUi = { status, btn: addBtn, statusText: null };
+
+      let showManualKey = false;
+      const keyNameIn = h("input", { class: "field mono grow", placeholder: "档案名 (如 gemini-key)" });
+      const keyValIn = h("input", { class: "field mono grow", type: "password", placeholder: "Gemini API Key (AIzaSy...)" });
+      const keySubBtn = h("button", {
+        class: "btn primary sm",
+        type: "button",
+        onclick: () => saveApiKeyAccount(keyNameIn.value.trim(), keyValIn.value.trim()),
+      }, "保存 API Key");
+
+      const keyBox = h("div", {
+        class: "col gap-xs",
+        style: "display:none; margin-top:8px; padding-top:8px; border-top:1px dashed var(--border)",
+      }, keyNameIn, keyValIn, keySubBtn);
+
+      const keyToggle = h("button", {
+        class: "btn sm",
+        type: "button",
+        style: "width:100%; margin-top:6px; font-size:12px",
+        onclick: () => {
+          showManualKey = !showManualKey;
+          keyBox.style.display = showManualKey ? "flex" : "none";
+          keyToggle.textContent = showManualKey ? "收起 API Key 录入" : "使用 Gemini API Key 登录";
+        },
+      }, "使用 Gemini API Key 登录");
+
+      addCard.append(addBtn, keyToggle, keyBox, status);
+      paintAddUi();
+    }
+    frag.appendChild(addCard);
 
     const accounts = data.accounts || [];
     if (accounts.length) {
       const list = h("div");
       for (const a of accounts) {
+        const cachedQ = force ? null : state.accountQuotas?.[a.name];
+        const qContainer = h("div", { class: "acct-quotas", id: `acct-quota-${a.name}` },
+          ...renderAccountQuotaPill(cachedQ, a.name));
+
         list.appendChild(h("div", { class: "acct-item" + (a.active ? " active" : "") },
           h("span", { class: "avatar", text: (a.email || a.name || "?")[0].toUpperCase() }),
           h("div", { class: "grow" },
             h("div", { class: "name" }, a.name,
               a.active ? h("span", { class: "tag blue", text: "active" }) : null),
-            a.email ? h("div", { class: "mail", text: a.email }) : null),
+            a.email ? h("div", { class: "mail", text: a.email }) : null,
+            qContainer),
           h("button", { class: "btn sm" + (a.active ? "" : " primary"), disabled: a.active, onclick: () => switchAccount(a.name) }, a.active ? "Active" : "Switch"),
           h("button", { class: "icon-btn sm", title: "删除", onclick: () => deleteAccount(a.name) }, icon("trash"))));
       }
@@ -2883,34 +3501,114 @@
     }
 
     body.replaceChildren(frag);
+    loadAccountQuotas(force);
+  }
+
+  function renderAccountQuotaPill(q, name) {
+    if (!q) {
+      return [h("span", { class: "acct-q-pill loading" }, h("span", { class: "spin" }), "配额加载中…")];
+    }
+    if (q.is_apikey || q.type === "apikey") {
+      return [h("span", { class: "acct-q-pill" }, h("span", { class: "q-dot g" }), h("span", { class: "q-name", text: "API Key 模式" }))];
+    }
+    if (q.error) {
+      return [h("span", { class: "acct-q-pill err", title: q.error }, h("span", { class: "q-name", text: "配额未获取" }))];
+    }
+
+    const pills = [];
+    // 1. Gemini Weekly
+    if (q.geminiWeekly) {
+      const gw = q.geminiWeekly;
+      const pct = gw.remainingPercent;
+      const isExhausted = gw.disabled || (pct != null && pct <= 0);
+      const cls = isExhausted ? "crit" : (levelClass(pct) || "ok");
+      const tip = `Gemini 7d 剩余: ${pct == null ? "—" : `${pct}%`}${gw.resetsIn ? ` · ${gw.resetsIn} 后刷新` : ""}${gw.description ? `\n${gw.description}` : ""}`;
+      pills.push(h("span", { class: `acct-q-pill g ${cls}`, title: tip },
+        h("span", { class: "q-dot" }),
+        h("span", { class: "q-name", text: "Gemini 7d" }),
+        h("span", { class: "q-bar" }, h("i", { style: `width:${pct == null ? 0 : Math.max(2, Math.min(100, pct))}%` })),
+        h("span", { class: "q-val", text: pct == null ? "—" : `${pct}%` })
+      ));
+    }
+
+    // 2. Claude Weekly
+    if (q.claudeWeekly) {
+      const cw = q.claudeWeekly;
+      const pct = cw.remainingPercent;
+      const isExhausted = cw.disabled || (pct != null && pct <= 0);
+      const cls = isExhausted ? "crit" : (levelClass(pct) || "ok");
+      const tip = `Claude 7d 剩余: ${pct == null ? "—" : `${pct}%`}${cw.resetsIn ? ` · ${cw.resetsIn} 后刷新` : ""}${cw.description ? `\n${cw.description}` : ""}`;
+      pills.push(h("span", { class: `acct-q-pill c ${cls}`, title: tip },
+        h("span", { class: "q-dot" }),
+        h("span", { class: "q-name", text: "Claude 7d" }),
+        h("span", { class: "q-bar" }, h("i", { style: `width:${pct == null ? 0 : Math.max(2, Math.min(100, pct))}%` })),
+        h("span", { class: "q-val", text: pct == null ? "—" : `${pct}%` })
+      ));
+    }
+
+    return pills.length ? pills : [h("span", { class: "acct-q-pill err", text: "无配额数据" })];
+  }
+
+  async function loadAccountQuotas(force = false) {
+    state.accountQuotasLoading = true;
+    try {
+      const res = await api(`/v1/accounts/quotas${force ? "?refresh=1" : ""}`, { timeoutMs: 35000 });
+      if (res?.ok && res.quotas) {
+        state.accountQuotas = res.quotas;
+        LS.set("agy.accountQuotas", res.quotas);
+        for (const [name, q] of Object.entries(res.quotas)) {
+          const el = $(`#acct-quota-${name}`);
+          if (el) el.replaceChildren(...renderAccountQuotaPill(q, name));
+        }
+      }
+    } catch (err) {
+      console.warn("loadAccountQuotas failed:", err);
+    } finally {
+      state.accountQuotasLoading = false;
+    }
   }
 
   async function beginBrowserOAuthFlow() {
     stopAddPoll();
-    setAddProgress("busy", "添加中…");
-    toast("正在打开浏览器…");
-    // Yield so the button paints before the network call
-    await new Promise((r) => requestAnimationFrame(() => r()));
+    setAddProgress("busy", "正在获取授权链接…");
+    toast("正在获取授权链接…");
+
+    // Pre-open new tab synchronously on click to guarantee popup blockers do not block it
+    let authWin = null;
+    try {
+      authWin = window.open("about:blank", "_blank");
+    } catch { /* ignore */ }
+
     try {
       const r = await api("/v1/accounts/oauth/start", {
         method: "POST",
         body: { auto: true },
-        timeoutMs: 30000,
+        timeoutMs: 15000,
       });
       addFlow.state = r.state || null;
-      setAddProgress("busy", "等待浏览器授权…");
-      toast("请在 Chrome 中完成授权");
-      startOAuthStatusPoll();
-      // After a few seconds assume user may have authorized — show capturing wording
-      setTimeout(() => {
-        if (addFlow.phase === "busy" && /等待浏览器/.test(addFlow.text || "")) {
-          setAddProgress("busy", "正在读取授权结果…");
+      addFlow.authUrl = r.authUrl || null;
+
+      if (r.authUrl) {
+        if (authWin && !authWin.closed) {
+          authWin.location.href = r.authUrl;
+          authWin.focus();
+        } else {
+          window.open(r.authUrl, "_blank");
         }
-      }, 6000);
+      }
+
+      setAddProgress("busy", "已打开 Google 授权窗口，请在其中授权…");
+      toast("已打开授权窗口，请登录并授权");
+      renderAccounts();
+      startOAuthStatusPoll();
       loadHealth();
     } catch (err) {
+      if (authWin && !authWin.closed) {
+        try { authWin.close(); } catch {}
+      }
       setAddProgress("err", `添加失败：${err.message}`);
       toast(`添加失败：${err.message}`, true);
+      renderAccounts();
     }
   }
 
@@ -3021,7 +3719,7 @@
     try {
       const r = await api("/v1/accounts/switch", { method: "POST", body: { name }, timeoutMs: 30000 });
       toast(`已切换到 ${r.name}${r.email ? `（${r.email}）` : ""}`);
-      renderAccounts();
+      renderAccounts(true);
       loadHealth();
       loadModels();
       loadUsage(true);
@@ -3035,6 +3733,7 @@
       await api(`/v1/accounts/${encodeURIComponent(name)}`, { method: "DELETE", timeoutMs: 15000 });
       toast(`已删除 ${name}`);
       renderAccounts();
+      loadHealth();
     } catch (err) {
       toast(`删除失败：${err.message}`, true);
     }
@@ -3201,15 +3900,7 @@
         }, "打开") : null,
         h("button", {
           class: "btn sm danger",
-          onclick: async (e) => {
-            e.stopPropagation();
-            if (owner && isLive(owner)) return stopRun(owner.id);
-            try {
-              const res = await api("/v1/agent/abort", { method: "POST", body: { run_id: r.run_id }, timeoutMs: 8000 });
-              toast(res.ok ? "已发送终止信号" : `终止失败：${res.error}`, !res.ok);
-            } catch (err) { toast(`终止失败：${err.message}`, true); }
-            setTimeout(loadRuns, 1200);
-          },
+          onclick: (e) => { e.stopPropagation(); abortRunId(r.run_id, owner); },
         }, "Abort")));
     }
   }
@@ -3298,6 +3989,8 @@
       e.preventDefault();
       addFiles(files);
     });
+    window.addEventListener("dragover", (e) => e.preventDefault());
+    window.addEventListener("drop", (e) => e.preventDefault());
   }
 
   $("#btnNewChat").onclick = newChat;
@@ -3334,7 +4027,7 @@
   $("#mask").onclick = closeDrawers;
   for (const b of $$("[data-close]")) b.onclick = closeDrawers;
   $("#quotaRefresh").onclick = () => loadUsage(true);
-  $("#accountRefresh").onclick = renderAccounts;
+  $("#accountRefresh").onclick = () => renderAccounts(true);
   $("#modalClose").onclick = closeModal;
   $("#modalWrap").addEventListener("click", (e) => { if (e.target.id === "modalWrap") closeModal(); });
 
@@ -3377,6 +4070,8 @@
   renderQMeter();
   autoGrow();
   loadHealth();
+  loadUsage(false);
+  loadAccountQuotas(false);
   setInterval(loadHealth, 30000);
   setInterval(loadRuns, 15000);
   setInterval(() => { if (!document.hidden && state.connected) loadUsage(false); }, 5 * 60000);

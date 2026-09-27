@@ -4,23 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyActiveProfileEnv } from "./accounts.js";
 import { resolveAgyBinary } from "./agyRunner.js";
+import { readJson, writeJson } from "./utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const PREFS_PATH = path.join(ROOT, "accounts", "prefs.json");
 
-function readJson(p, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(p, obj) {
-  fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
-}
 
 /**
  * Parse `agy models` output:

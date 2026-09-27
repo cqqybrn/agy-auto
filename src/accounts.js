@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync } from "node:fs";
+import { readJson, writeJson, resolveAgyBinary as resolveAgyBinaryShared } from "./utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -25,20 +26,14 @@ function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
 
-function readJson(p, fallback = null) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(p, obj) {
-  ensureDir(path.dirname(p));
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
-}
+let winCredReadCache = null;
+let winCredReadCacheTime = 0;
 
 function runWinCred(action, extra = {}) {
+  if (action === "read" && winCredReadCache && Date.now() - winCredReadCacheTime < 3000) {
+    return winCredReadCache;
+  }
+
   const args = [
     "-NoProfile",
     "-ExecutionPolicy",
@@ -57,6 +52,7 @@ function runWinCred(action, extra = {}) {
   const r = spawnSync("powershell.exe", args, {
     encoding: "utf8",
     windowsHide: true,
+    timeout: 8000,
   });
   if (r.error) throw r.error;
   const out = (r.stdout || "").trim();
@@ -68,10 +64,19 @@ function runWinCred(action, extra = {}) {
   // PowerShell may emit BOM / warnings; take last JSON line
   const lines = out.split(/\r?\n/).filter((l) => l.trim().startsWith("{"));
   const jsonLine = lines[lines.length - 1] || out;
-  return JSON.parse(jsonLine);
+  const parsed = JSON.parse(jsonLine);
+
+  if (action === "read") {
+    winCredReadCache = parsed;
+    winCredReadCacheTime = Date.now();
+  } else {
+    winCredReadCache = null;
+    winCredReadCacheTime = 0;
+  }
+  return parsed;
 }
 
-function decodeJwtEmail(idToken) {
+export function decodeJwtEmail(idToken) {
   if (!idToken || typeof idToken !== "string") return null;
   const parts = idToken.split(".");
   if (parts.length < 2) return null;
@@ -105,8 +110,8 @@ function readWinCredOAuth() {
  * Newer CLI logins often only write WinCred, not ~/.gemini/oauth_creds.json.
  * Mirror the blob into the files our UI / save path expect.
  */
-export function syncLiveOAuthFilesFromWinCred() {
-  const packed = readWinCredOAuth();
+export function syncLiveOAuthFilesFromWinCred(packedParam = null) {
+  const packed = packedParam || readWinCredOAuth();
   if (!packed) return null;
   const { oauth } = packed;
   const email =
@@ -124,22 +129,28 @@ export function syncLiveOAuthFilesFromWinCred() {
   return { email, oauth };
 }
 
-function currentEmail() {
-  const ga = readJson(GOOGLE_ACCOUNTS, {});
-  if (ga?.active) return ga.active;
+export function currentEmail() {
+  // Ground truth: live WinCred credential used by agy CLI
+  const packed = readWinCredOAuth();
+  if (packed?.oauth) {
+    const liveEmail =
+      decodeJwtEmail(packed.oauth.id_token) ||
+      decodeJwtEmail(packed.oauth.token?.id_token) ||
+      packed.oauth.email ||
+      null;
+    if (liveEmail) return liveEmail;
+  }
+
+  // Fallback: oauth_creds.json file
   const oauth = readJson(OAUTH_CREDS, {});
-  const fromFile = decodeJwtEmail(oauth?.id_token);
+  const fromFile = decodeJwtEmail(oauth?.id_token) || decodeJwtEmail(oauth?.token?.id_token);
   if (fromFile) return fromFile;
 
-  // Fallback: CLI login may only live in WinCred
-  const packed = readWinCredOAuth();
-  if (!packed) return null;
-  return (
-    decodeJwtEmail(packed.oauth.id_token) ||
-    decodeJwtEmail(packed.oauth.token?.id_token) ||
-    packed.oauth.email ||
-    null
-  );
+  // Fallback: google_accounts.json file
+  const ga = readJson(GOOGLE_ACCOUNTS, {});
+  if (ga?.active) return ga.active;
+
+  return null;
 }
 
 function profileDir(name) {
@@ -256,6 +267,7 @@ export function saveAccount(name, { asApiKey, apiKey, note } = {}) {
   });
 
   setActive(name);
+  invalidateWhoamiCache();
   return { name, type: "oauth", email, active: true };
 }
 
@@ -285,6 +297,7 @@ export function switchAccount(name) {
       AGY_ACCOUNT_TYPE: "apikey",
     });
     setActive(name);
+    invalidateWhoamiCache();
     return {
       name,
       type: "apikey",
@@ -328,6 +341,7 @@ export function switchAccount(name) {
   });
   // clear any lingering key from env file
   setActive(name);
+  invalidateWhoamiCache();
   return {
     name,
     type: "oauth",
@@ -363,7 +377,14 @@ export function removeAccount(name) {
     if (fs.existsSync(ACTIVE_PATH)) fs.unlinkSync(ACTIVE_PATH);
     const runtime = path.join(ACCOUNTS_DIR, "runtime.env.json");
     if (fs.existsSync(runtime)) fs.unlinkSync(runtime);
+    const remaining = listProfiles().filter((p) => p.name !== name);
+    if (remaining.length > 0) {
+      try {
+        switchAccount(remaining[0].name);
+      } catch { /* ignore */ }
+    }
   }
+  invalidateWhoamiCache();
   return { removed: name };
 }
 
@@ -378,20 +399,14 @@ export function clearLiveAuth() {
   }
   // keep google_accounts.json but mark empty-ish
   writeJson(GOOGLE_ACCOUNTS, { active: null, old: [] });
+  invalidateWhoamiCache();
   return { cleared: true };
 }
 
 function resolveAgyBinaryLocal() {
-  if (process.env.AGY_BIN && existsSync(process.env.AGY_BIN)) return process.env.AGY_BIN;
-  const local = path.join(
-    process.env.LOCALAPPDATA || "",
-    "agy",
-    "bin",
-    process.platform === "win32" ? "agy.exe" : "agy"
-  );
-  if (existsSync(local)) return local;
-  return process.platform === "win32" ? "agy.exe" : "agy";
+  return resolveAgyBinaryShared();
 }
+
 
 /**
  * Open interactive `agy` in a new console so the browser OAuth flow can run.
@@ -487,9 +502,9 @@ export function beginAddAccount({ saveCurrentAs, skipSaveCurrent = false } = {})
   };
 }
 
-/** Suggest a profile name from live email. */
-export function suggestProfileName() {
-  const email = currentEmail();
+/** Suggest a profile name from live or explicit email. */
+export function suggestProfileName(explicitEmail = null) {
+  const email = explicitEmail || currentEmail();
   if (!email) return null;
   const base = email.split("@")[0].replace(/[^\w.+-]+/g, "_") || "account";
   const taken = new Set(listProfiles().map((p) => p.name.toLowerCase()));
@@ -501,28 +516,62 @@ export function suggestProfileName() {
   return `${base}_${Date.now().toString(36)}`;
 }
 
-export function whoami() {
-  // Refresh sidecar files from WinCred when present (CLI-only login)
-  try {
-    if (runWinCred("exists")?.exists) syncLiveOAuthFilesFromWinCred();
-  } catch { /* ignore */ }
+let whoamiCache = null;
+let whoamiCacheTime = 0;
+
+export function invalidateWhoamiCache() {
+  whoamiCache = null;
+  whoamiCacheTime = 0;
+}
+
+export function whoami(force = false) {
+  const now = Date.now();
+  if (!force && whoamiCache && now - whoamiCacheTime < 5000) {
+    return whoamiCache;
+  }
+
+  const packed = readWinCredOAuth();
+  let email = null;
+  if (packed?.oauth) {
+    email =
+      decodeJwtEmail(packed.oauth.id_token) ||
+      decodeJwtEmail(packed.oauth.token?.id_token) ||
+      packed.oauth.email ||
+      null;
+  }
+  if (!email) {
+    const oauth = readJson(OAUTH_CREDS, {});
+    email = decodeJwtEmail(oauth?.id_token) || decodeJwtEmail(oauth?.token?.id_token);
+  }
+  if (!email) {
+    const ga = readJson(GOOGLE_ACCOUNTS, {});
+    email = ga?.active || null;
+  }
+
+  const wincredExists = Boolean(email || packed?.cred?.exists);
+  if (packed?.oauth) {
+    try {
+      syncLiveOAuthFilesFromWinCred(packed);
+    } catch { /* ignore */ }
+  }
 
   const active = getActive();
-  const email = currentEmail();
-  const cred = runWinCred("exists");
   const runtime = readJson(path.join(ACCOUNTS_DIR, "runtime.env.json"), {});
   const profiles = listProfiles();
   const alreadySaved = email
     ? profiles.some((p) => p.email && p.email.toLowerCase() === email.toLowerCase())
     : false;
-  return {
+  const res = {
     activeProfile: active,
     email,
-    wincredExists: Boolean(cred.exists),
+    wincredExists,
     accountType: runtime.AGY_ACCOUNT_TYPE || (active ? profiles.find((p) => p.name === active)?.type : null),
-    suggestedName: email ? suggestProfileName() : null,
+    suggestedName: email ? suggestProfileName(email) : null,
     alreadySaved,
   };
+  whoamiCache = res;
+  whoamiCacheTime = now;
+  return res;
 }
 
 /**
@@ -540,19 +589,3 @@ export function applyActiveProfileEnv(baseEnv = process.env) {
   return { ...baseEnv, ...getRuntimeEnv() };
 }
 
-export const accountsApi = {
-  saveAccount,
-  switchAccount,
-  removeAccount,
-  clearLiveAuth,
-  startCliLogin,
-  beginAddAccount,
-  suggestProfileName,
-  syncLiveOAuthFilesFromWinCred,
-  listProfiles,
-  whoami,
-  getActive,
-  getRuntimeEnv,
-  applyActiveProfileEnv,
-  ACCOUNTS_DIR,
-};
