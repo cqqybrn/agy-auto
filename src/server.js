@@ -925,4 +925,58 @@ server.listen(PORT, HOST, () => {
   }
   if (API_KEY) console.log(`[agy-auto] API key auth enabled`);
   else console.log(`[agy-auto] API key auth disabled (set AGY_API_KEY to enable)`);
+  if (process.env.AGY_WSL_LISTEN !== "0") startWslListener();
 });
+
+/**
+ * Extra listener on the Hyper-V "vEthernet (WSL)" address so WSL programs can call the
+ * chat API (agy launched from WSL interop cannot read the Windows credential store).
+ * Only WSL-subnet clients and the chat/models endpoints are allowed; the LAN never sees it.
+ */
+const WSL_PATHS = new Set(["/health", "/v1/models", "/v1/chat/completions", "/chat/completions"]);
+let wslServer = null;
+let wslBound = null;
+
+function findWslInterface() {
+  for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
+    if (!/wsl/i.test(name)) continue;
+    const a = (addrs || []).find((x) => x.family === "IPv4" && !x.internal);
+    if (a) return a;
+  }
+  return null;
+}
+
+const ipToInt = (ip) => ip.split(".").reduce((n, p) => (n << 8) + Number(p), 0) >>> 0;
+
+function startWslListener() {
+  const check = () => {
+    const iface = findWslInterface();
+    if ((iface?.address || null) === wslBound) return;
+    if (wslServer) {
+      wslServer.close();
+      wslServer = null;
+      wslBound = null;
+    }
+    if (!iface) return;
+    const mask = ipToInt(iface.netmask);
+    const net = ipToInt(iface.address) & mask;
+    const handler = server.listeners("request")[0];
+    const s = http.createServer((req, res) => {
+      const remote = String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
+      const pathname = new URL(req.url || "/", "http://wsl").pathname;
+      if (!/^\d+\.\d+\.\d+\.\d+$/.test(remote) || (ipToInt(remote) & mask) !== net || !WSL_PATHS.has(pathname)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { message: "forbidden" } }));
+      }
+      handler(req, res);
+    });
+    s.on("error", (err) => console.log(`[agy-auto] WSL listener error: ${err.message}`));
+    s.listen(PORT, iface.address, () => {
+      wslServer = s;
+      wslBound = iface.address;
+      console.log(`[agy-auto] WSL listener on http://${iface.address}:${PORT} (chat API only, WSL subnet only)`);
+    });
+  };
+  check();
+  setInterval(check, 60_000).unref();
+}
