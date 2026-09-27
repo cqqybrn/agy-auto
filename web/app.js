@@ -1505,7 +1505,10 @@
       const stats = aggregateStepStats(bucket);
       const busy = turn.status === "running" || bucket.some((b) => b.state === "running");
       const key = noise ? "_noiseOpen" : "_stepsOpen";
-      if (turn[key] == null) turn[key] = noise ? false : busy;
+      if (turn[key] == null) {
+        const hasText = (turn.blocks || []).some((b) => b.kind === "text" && b.text);
+        turn[key] = noise ? false : (busy && bucket.length <= 4 && !hasText);
+      }
       const open = !!turn[key];
       const body = h("div", { class: "steps-body" });
       for (const b of bucket) {
@@ -2270,16 +2273,25 @@
             schedulePaint(turn, null, true);
           }
         }
+        const text = d.text_delta || d.content || d.text || d.response;
+        if (text && typeof text === "string" && text.trim()) {
+          const key = si != null ? `t${si}` : uid("t");
+          upsertBlock(turn, key, "text", (b) => {
+            b.text = text;
+          });
+        }
         break;
       }
       case "text_delta": {
+        const text = d.text_delta ?? d.content ?? d.text ?? "";
+        if (!text) break;
         const last = turn.blocks[turn.blocks.length - 1];
         const key = si != null ? `t${si}` : last?.kind === "text" ? last.key : uid("t");
         upsertBlock(turn, key, "text", (b) => {
-          const delta = d.text_delta ?? "";
           b.text = b.text || "";
-          if (b.text && delta.length > b.text.length && delta.startsWith(b.text)) b.text = delta;
-          else b.text += delta;
+          if (b.text && text.length > b.text.length && text.startsWith(b.text)) b.text = text;
+          else if (b.text && text === b.text) { /* already exact match */ }
+          else b.text += text;
         });
         break;
       }
@@ -2381,8 +2393,8 @@
       const data = await api(`/v1/transcripts/${encodeURIComponent(cid)}?limit=1500`, { timeoutMs: 12000 });
       if (!data?.ok || !Array.isArray(data.steps)) return;
 
-      const turns = conv.turns || [];
-      if (!turns.length) return;
+      if (!conv.turns) conv.turns = [];
+      const turns = conv.turns;
 
       // Group transcript steps by USER_INPUT
       const partitions = [];
@@ -2396,6 +2408,31 @@
         }
       }
       if (cur.length > 0) partitions.push(cur);
+      if (!partitions.length) return;
+
+      let needRerender = false;
+      if (partitions.length > turns.length) {
+        for (let pi = turns.length; pi < partitions.length; pi++) {
+          const p = partitions[pi];
+          const userStep = p.find((s) => /user_input|user/i.test(`${s.type || ""} ${s.source || ""}`));
+          const rawPrompt = userStep?.content || "";
+          const cleanPrompt = cleanUserPrompt(rawPrompt) || (pi === 0 ? conv.title : "用户输入");
+          turns.push({
+            id: `t_${conv.conversationId}_${pi}`,
+            prompt: cleanPrompt,
+            at: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
+            startedAt: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
+            endedAt: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
+            status: "done",
+            blocks: [],
+          });
+          needRerender = true;
+        }
+        if (needRerender && conv.id === state.activeId) {
+          renderThread();
+          return;
+        }
+      }
 
       let updated = false;
       for (let i = 0; i < turns.length; i++) {
@@ -2469,14 +2506,43 @@
           }
         }
 
-        // Restore response text if missing
-        if (!t.blocks?.some((b) => b.kind === "text")) {
-          const lastModel = [...part].reverse().find((s) => s.content && typeof s.content === "string");
+        // Restore or update response text from transcript
+        const textSteps = part.filter((s) =>
+          /planner_response|agent_response|model_response|text/i.test(`${s.type || ""}`) &&
+          s.content && typeof s.content === "string" && s.content.trim()
+        );
+        if (textSteps.length > 0) {
+          for (const ts of textSteps) {
+            if (!t.blocks) t.blocks = [];
+            const key = `t${ts.step_index}`;
+            let textBlock = t.blocks.find((b) => b.key === key || (textSteps.length === 1 && b.key === "final-tx"));
+            if (!textBlock) {
+              t.blocks.push({ kind: "text", key, text: ts.content });
+              if (attached(t)) paintAllBlocks(t);
+              updated = true;
+            } else if (textBlock.text !== ts.content && ts.content.length > (textBlock.text || "").length) {
+              textBlock.text = ts.content;
+              if (attached(t)) paintAllBlocks(t);
+              updated = true;
+            }
+          }
+        } else {
+          const lastModel = [...part].reverse().find((s) =>
+            s.content && typeof s.content === "string" && s.content.trim() &&
+            !/generic|system_message|tool_output|user_input/i.test(`${s.type || ""}`)
+          );
           if (lastModel?.content) {
             if (!t.blocks) t.blocks = [];
-            t.blocks.push({ kind: "text", key: "final-tx", text: lastModel.content });
-            if (attached(t)) paintAllBlocks(t);
-            updated = true;
+            let textBlock = t.blocks.find((b) => b.kind === "text");
+            if (!textBlock) {
+              t.blocks.push({ kind: "text", key: "final-tx", text: lastModel.content });
+              if (attached(t)) paintAllBlocks(t);
+              updated = true;
+            } else if (textBlock.text !== lastModel.content && lastModel.content.length > (textBlock.text || "").length) {
+              textBlock.text = lastModel.content;
+              if (attached(t)) paintAllBlocks(t);
+              updated = true;
+            }
           }
         }
       }
@@ -4059,6 +4125,50 @@
     if (state.live.size) { e.preventDefault(); e.returnValue = ""; }
   });
 
+  async function syncConvsFromBackend() {
+    try {
+      const data = await api("/v1/conversations?limit=60", { timeoutMs: 8000 });
+      if (!Array.isArray(data?.conversations)) return;
+      let updated = false;
+      for (const dc of data.conversations) {
+        if (!dc.id) continue;
+        let local = state.convs.find((c) => c.conversationId === dc.id || c.id === dc.id);
+        if (!local) {
+          state.convs.push({
+            id: dc.id,
+            title: dc.title || "Conversation",
+            conversationId: dc.id,
+            createdAt: dc.createdAt || Date.now(),
+            updatedAt: dc.updatedAt || Date.now(),
+            turns: [
+              {
+                id: `t_${dc.id}_0`,
+                prompt: dc.prompt || dc.title,
+                at: dc.createdAt || Date.now(),
+                startedAt: dc.createdAt || Date.now(),
+                status: "done",
+                blocks: [],
+              },
+            ],
+            queue: [],
+          });
+          updated = true;
+        } else {
+          if (!local.conversationId) {
+            local.conversationId = dc.id;
+            updated = true;
+          }
+        }
+      }
+      if (updated) {
+        scheduleSave();
+        renderConvList();
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
   // ==========================================================
   // Boot
   // ==========================================================
@@ -4072,6 +4182,7 @@
   loadHealth();
   loadUsage(false);
   loadAccountQuotas(false);
+  syncConvsFromBackend();
   setInterval(loadHealth, 30000);
   setInterval(loadRuns, 15000);
   setInterval(() => { if (!document.hidden && state.connected) loadUsage(false); }, 5 * 60000);

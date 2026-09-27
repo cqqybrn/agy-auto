@@ -264,8 +264,16 @@ export function normalizeStreamEvent(raw) {
         thinking: s.thinking || s.thought || s.text_delta || s.content || "",
       };
     }
-    if (s.step_type === "agent_response" && s.text_delta != null) {
-      return { ...base, type: "text_delta", text_delta: s.text_delta };
+    const respText = s.text_delta ?? s.content ?? s.response ?? s.text ?? null;
+    if (
+      (s.step_type === "agent_response" ||
+        s.step_type === "planner_response" ||
+        s.step_type === "model_response" ||
+        s.step_type === "text" ||
+        (!s.step_type && respText != null)) &&
+      respText != null
+    ) {
+      return { ...base, type: "text_delta", text_delta: respText, content: respText };
     }
     if (
       s.tool_name === "invoke_subagent" ||
@@ -752,6 +760,61 @@ export function deleteConversationArtifacts(ids = []) {
     count: results.reduce((n, r) => n + r.removed.length, 0),
   };
 }
+
+export function listOnDiskConversations({ limit = 60 } = {}) {
+  const map = new Map();
+  for (const root of geminiRoots()) {
+    const brainDir = path.join(root, "brain");
+    if (!existsSync(brainDir)) continue;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(brainDir);
+    } catch {
+      continue;
+    }
+    for (const id of entries) {
+      if (!isConversationId(id) || map.has(id)) continue;
+      const txPath = path.join(brainDir, id, ".system_generated", "logs", "transcript.jsonl");
+      if (!existsSync(txPath)) continue;
+      try {
+        const st = fs.statSync(txPath);
+        let title = "Conversation";
+        let prompt = "";
+        let createdAt = st.birthtimeMs || st.mtimeMs;
+        const fd = fs.openSync(txPath, "r");
+        const buf = Buffer.alloc(2048);
+        const bytes = fs.readSync(fd, buf, 0, 2048, 0);
+        fs.closeSync(fd);
+        const firstLine = buf.toString("utf8", 0, bytes).split(/\r?\n/)[0];
+        if (firstLine) {
+          try {
+            const row = JSON.parse(firstLine);
+            if (row.created_at) createdAt = new Date(row.created_at).getTime();
+            let c = row.content || "";
+            const m = c.match(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/i);
+            if (m) c = m[1];
+            c = c.replace(/<[^>]+>/g, "").trim();
+            if (c) {
+              prompt = c;
+              title = c.length > 50 ? c.slice(0, 50) + "…" : c;
+            }
+          } catch {}
+        }
+        map.set(id, {
+          id,
+          conversation_id: id,
+          title,
+          prompt,
+          createdAt,
+          updatedAt: st.mtimeMs,
+          path: txPath,
+        });
+      } catch {}
+    }
+  }
+  return [...map.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+}
+
 
 function readAgentMd(dir) {
   const md = path.join(dir, "agent.md");

@@ -15,6 +15,7 @@ import {
   listAgents,
   readTranscript,
   deleteConversationArtifacts,
+  listOnDiskConversations,
 } from "./agyRunner.js";
 import {
   listProfiles,
@@ -511,6 +512,11 @@ const server = http.createServer(async (req, res) => {
       const includeThinking = url.searchParams.get("thinking") !== "0";
       const data = await readTranscript(id, { limit, includeThinking });
       return sendJson(res, data.ok ? 200 : 404, data);
+    }
+
+    if (req.method === "GET" && url.pathname === "/v1/conversations") {
+      const limit = Number(url.searchParams.get("limit") || 60);
+      return sendJson(res, 200, { conversations: listOnDiskConversations({ limit }) });
     }
 
     // Purge brain/ + conversations/*.db residuals (and discovered subagent ids)
