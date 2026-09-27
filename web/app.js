@@ -2218,38 +2218,45 @@
   }
 
   async function runStream(conv, turn, payload, live) {
-    const res = await fetch(apiUrl("/v1/agent/stream"), {
-      method: "POST",
-      headers: headers(true),
-      body: JSON.stringify(payload),
-      signal: live.ctrl.signal,
-    });
-    if (!res.ok || !res.body) {
-      const data = await res.json().catch(() => ({}));
-      throw apiError(res, data);
-    }
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let m;
-      while ((m = buf.match(/\r?\n\r?\n/))) {
-        const block = buf.slice(0, m.index);
-        buf = buf.slice(m.index + m[0].length);
-        let ev = "message";
-        const data = [];
-        for (const line of block.split(/\r?\n/)) {
-          if (line.startsWith("event:")) ev = line.slice(6).trim();
-          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
-        }
-        if (!data.length) continue;
-        let obj;
-        try { obj = JSON.parse(data.join("\n")); } catch { continue; }
-        onStreamEvent(conv, turn, live, ev, obj);
+    const enrichTimer = setInterval(() => {
+      if (conv.conversationId) enrichTurnFromTranscript(conv, turn);
+    }, 3000);
+    try {
+      const res = await fetch(apiUrl("/v1/agent/stream"), {
+        method: "POST",
+        headers: headers(true),
+        body: JSON.stringify(payload),
+        signal: live.ctrl.signal,
+      });
+      if (!res.ok || !res.body) {
+        const data = await res.json().catch(() => ({}));
+        throw apiError(res, data);
       }
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let m;
+        while ((m = buf.match(/\r?\n\r?\n/))) {
+          const block = buf.slice(0, m.index);
+          buf = buf.slice(m.index + m[0].length);
+          let ev = "message";
+          const data = [];
+          for (const line of block.split(/\r?\n/)) {
+            if (line.startsWith("event:")) ev = line.slice(6).trim();
+            else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+          }
+          if (!data.length) continue;
+          let obj;
+          try { obj = JSON.parse(data.join("\n")); } catch { continue; }
+          onStreamEvent(conv, turn, live, ev, obj);
+        }
+      }
+    } finally {
+      clearInterval(enrichTimer);
     }
   }
 
@@ -2445,10 +2452,6 @@
           });
           needRerender = true;
         }
-        if (needRerender && conv.id === state.activeId) {
-          renderThread();
-          return;
-        }
       }
 
       let updated = false;
@@ -2570,7 +2573,10 @@
           }
         }
       }
-      if (updated) scheduleSave();
+      if (updated || needRerender) {
+        scheduleSave();
+        if (needRerender && conv.id === state.activeId) renderThread();
+      }
     } catch {
       // Non-fatal background fetch
     } finally {

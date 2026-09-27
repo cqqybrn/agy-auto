@@ -257,19 +257,25 @@ export function normalizeStreamEvent(raw) {
   }
   if (raw.event === "step_update" && raw.step_update) {
     const s = raw.step_update;
+    const st = String(s.step_type || s.type || "").toLowerCase();
+    const respText = s.text_delta ?? s.content ?? s.response ?? s.text ?? null;
+    const isToolOutput = isToolOutputText(respText);
+
     const base = {
       type: "step",
-      step_type: s.step_type,
+      step_type: st,
       state: s.state,
       step_index: s.step_index,
       conversation_id: s.conversation_id,
       duration_seconds: s.duration_seconds,
       usage: s.usage,
       thinking: s.thinking || s.thought || null,
+      content: respText,
+      text_delta: respText,
       raw,
     };
 
-    if (s.step_type === "thought" || s.step_type === "thinking") {
+    if (st === "thought" || st === "thinking") {
       return {
         ...base,
         type: "thinking",
@@ -277,15 +283,13 @@ export function normalizeStreamEvent(raw) {
         thinking: s.thinking || s.thought || s.text_delta || s.content || "",
       };
     }
-    const respText = s.text_delta ?? s.content ?? s.response ?? s.text ?? null;
-    const isToolOutput = isToolOutputText(respText);
     if (
       !isToolOutput &&
-      (s.step_type === "agent_response" ||
-        s.step_type === "planner_response" ||
-        s.step_type === "model_response" ||
-        s.step_type === "text" ||
-        (!s.step_type && respText != null)) &&
+      (st === "agent_response" ||
+        st === "planner_response" ||
+        st === "model_response" ||
+        st === "text" ||
+        (!st && respText != null)) &&
       respText != null
     ) {
       return { ...base, type: "text_delta", text_delta: respText, content: respText };
@@ -293,7 +297,7 @@ export function normalizeStreamEvent(raw) {
     if (
       s.tool_name === "invoke_subagent" ||
       s.tool_info?.name === "invoke_subagent" ||
-      s.step_type === "subagent" ||
+      st === "subagent" ||
       s.subagent_info
     ) {
       const toolInfo = s.tool_info || {};
@@ -333,7 +337,7 @@ export function normalizeStreamEvent(raw) {
         subagent_info: s.subagent_info || { subagents: subs },
       };
     }
-    if (s.step_type === "tool" || s.tool_name || s.tool_info) {
+    if (st === "tool" || s.tool_name || s.tool_info) {
       return {
         ...base,
         type: "tool",
@@ -341,10 +345,10 @@ export function normalizeStreamEvent(raw) {
         tool_info: s.tool_info || null,
       };
     }
-    if (s.step_type === "system_message") {
+    if (st === "system_message") {
       return { ...base, type: "system", text_delta: s.text_delta || s.content || null };
     }
-    if (s.step_type === "error_message") {
+    if (st === "error_message") {
       return {
         ...base,
         type: "error_message",
