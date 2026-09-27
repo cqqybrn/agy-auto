@@ -958,15 +958,26 @@
           h("span", { class: "proj-name", text: projectLabel(g.cwd) }),
           h("span", { class: "proj-count", text: String(g.items.length) }),
         ),
-        h("button", {
-          class: "proj-add",
-          type: "button",
-          title: g.cwd ? `在「${projectLabel(g.cwd)}」中新建会话` : "新建未绑定项目的会话",
-          onclick: (e) => {
-            e.stopPropagation();
-            newChatInProject(g.cwd || "");
-          },
-        }, icon("plus")),
+        h("div", { class: "proj-actions" },
+          h("button", {
+            class: "proj-clear",
+            type: "button",
+            title: `清空「${projectLabel(g.cwd)}」下的全部 ${g.items.length} 个会话`,
+            onclick: (e) => {
+              e.stopPropagation();
+              clearProjectConvs(g.cwd || "", g.items);
+            },
+          }, icon("trash")),
+          h("button", {
+            class: "proj-add",
+            type: "button",
+            title: g.cwd ? `在「${projectLabel(g.cwd)}」中新建会话` : "新建未绑定项目的会话",
+            onclick: (e) => {
+              e.stopPropagation();
+              newChatInProject(g.cwd || "");
+            },
+          }, icon("plus")),
+        ),
       );
       list.appendChild(h("div", { class: "proj-group" }, head));
       if (!collapsed) {
@@ -1233,6 +1244,68 @@
     closeRunsPop();
     setTimeout(loadRuns, 400);
     toast(`对话已删除${runIds.size ? "，任务已停止" : ""}${purged ? `，清理 ${purged} 个文件` : ""}`);
+  }
+
+  async function clearProjectConvs(cwd, items) {
+    if (!items || !items.length) return;
+    const label = projectLabel(cwd);
+    const n = items.length;
+    if (!confirm(`确定清空「${label}」分组下的全部 ${n} 个会话？\n\n将同时停止相关运行并删除本地残留文件（brain / db）。此操作不可撤销。`)) return;
+
+    const itemIds = new Set(items.map((x) => x.id));
+    const activeRunIdSet = new Set((state.runs || []).map((r) => r.run_id));
+    const runIds = new Set();
+    const convIds = new Set();
+
+    for (const c of items) {
+      const live = state.live.get(c.id);
+      if (live?.runId) runIds.add(live.runId);
+      if (c.conversationId) convIds.add(c.conversationId);
+      for (const t of c.turns || []) {
+        if (t.runId && activeRunIdSet.has(t.runId)) runIds.add(t.runId);
+        for (const b of t.blocks || []) {
+          if (b.kind !== "subagent") continue;
+          for (const sa of b.subagents || []) {
+            const sid = sa.transcript_id || sa.conversation_id;
+            if (sid) convIds.add(sid);
+          }
+        }
+      }
+      if (live) {
+        try { await stopRun(c.id, true); } catch { /* ignore */ }
+      }
+      state.live.delete(c.id);
+    }
+
+    for (const rid of runIds) {
+      try {
+        await api("/v1/agent/abort", { method: "POST", body: { run_id: rid }, timeoutMs: 8000 });
+      } catch { /* ignore */ }
+    }
+
+    let purged = 0;
+    if (convIds.size) {
+      try {
+        const res = await api("/v1/conversations/purge", {
+          method: "POST",
+          body: { conversation_ids: [...convIds] },
+          timeoutMs: 60000,
+        });
+        purged = res.count || 0;
+      } catch (err) {
+        toast(`残留文件清理失败：${err.message}`, true);
+      }
+    }
+
+    state.convs = state.convs.filter((x) => !itemIds.has(x.id));
+    if (state.activeId && itemIds.has(state.activeId)) state.activeId = null;
+    LS.set("agy.activeConv", state.activeId);
+    saveNow();
+    renderConvList();
+    renderThread();
+    closeRunsPop();
+    setTimeout(loadRuns, 400);
+    toast(`已清空「${label}」下的 ${n} 个会话${purged ? `，清理 ${purged} 个文件` : ""}`);
   }
 
   // ==========================================================

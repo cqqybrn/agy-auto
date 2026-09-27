@@ -247,14 +247,19 @@ body.side-collapsed #sidebar { margin-left: calc(-1 * var(--side-w)); }
   font-size: 10.5px; color: var(--text-faint); font-weight: 500;
   padding: 1px 6px; border-radius: 999px; background: var(--hover); flex: none;
 }
-.proj-add {
+.proj-actions {
+  display: flex; align-items: center; gap: 2px; flex: none;
+}
+.proj-clear, .proj-add {
   width: 26px; height: 26px; border-radius: 7px; flex: none;
   display: grid; place-items: center; color: var(--text-faint);
   opacity: 0; transition: opacity .12s, background .12s, color .12s;
 }
+.proj-head:hover .proj-clear, .proj-clear:focus-visible,
 .proj-head:hover .proj-add, .proj-add:focus-visible { opacity: 1; }
+.proj-clear:hover { background: rgba(243,139,132,.12); color: var(--red); }
 .proj-add:hover { background: var(--hover); color: var(--blue); }
-.proj-add svg.i { width: 14px; height: 14px; }
+.proj-clear svg.i, .proj-add svg.i { width: 14px; height: 14px; }
 .proj-head.collapsed .proj-count { background: transparent; }
 
 .conv-item {
