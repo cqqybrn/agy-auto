@@ -12,9 +12,17 @@ runtime.env.json
 oauth-client.json
 active.json
 prefs.json
+google_accounts.json
+oauth_creds.json
+settings.snippet.json
+wincred.b64
+*quota-cache.json
+*usage-cache.json
+*local-usage.json
 
 # Accounts directory (contains credentials, tokens, and account data)
 accounts/
+accounts/**
 
 # Logs
 *.log
