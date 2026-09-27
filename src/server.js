@@ -294,6 +294,10 @@ function listFsDir(dir) {
   };
 }
 
+const CHAT_NO_TOOLS_PREFIX =
+  "[Plain chat completion request] Do not call any tools, do not read or write files, do not run commands. " +
+  "Answer directly in text, following the output format requested below exactly.";
+
 function openaiChatResponse({ id, model, content, usage }) {
   return {
     id: id || `chatcmpl-agy-${Date.now()}`,
@@ -797,43 +801,93 @@ const server = http.createServer(async (req, res) => {
       (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")
     ) {
       const body = await readBody(req);
-      const prompt =
+      let prompt =
         body.prompt || extractPromptFromOpenAIMessages(body.messages || []);
       if (!prompt) throw bad("messages or prompt required");
+      if (body.no_tools ?? body.metadata?.no_tools ?? true) {
+        prompt = `${CHAT_NO_TOOLS_PREFIX}\n\n${prompt}`;
+      }
       const model = resolveDefaultModel(body.model);
       const prefs = getPrefs();
       const agent = resolveDefaultAgent(body.agent || body.metadata?.agent);
-      const result = await runAgy({
-        prompt,
-        cwd: body.cwd || body.metadata?.cwd || prefs.defaultCwd || DEFAULT_CWD,
-        model,
-        effort: body.effort || body.metadata?.effort || prefs.defaultEffort,
-        agent,
-        conversationId: body.conversation_id || body.metadata?.conversation_id,
-        continueLast: Boolean(body.continue || body.metadata?.continue),
-        outputFormat: "json",
-        printTimeout: body.print_timeout,
-        timeoutMs: body.timeout_ms,
-        mode: body.mode || body.metadata?.mode,
+      const runId = `chat_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const id = `chatcmpl-agy-${Date.now()}`;
+      const created = Math.floor(Date.now() / 1000);
+      const modelName = model || body.model || "antigravity";
+      const stream = Boolean(body.stream);
+      let streamed = "";
+      const chunk = (delta, finish = null) =>
+        `data: ${JSON.stringify({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: modelName,
+          choices: [{ index: 0, delta, finish_reason: finish }],
+        })}\n\n`;
+      if (stream) {
+        res.writeHead(200, SSE_HEADERS);
+        res.write(chunk({ role: "assistant", content: "" }));
+      }
+      let finished = false;
+      res.on("close", () => {
+        if (!finished) abortRun(runId);
       });
+      const ping = stream ? setInterval(() => res.write(": ping\n\n"), 15000) : null;
+      let summary;
       try {
-        recordLocalUsage({
-          model,
-          usage: result.usage,
-          conversationId: result.conversationId,
-        });
+        summary = await runAgyStream(
+          {
+            prompt,
+            runId,
+            stdinPrompt: true,
+            cwd: body.cwd || body.metadata?.cwd || prefs.defaultCwd || DEFAULT_CWD,
+            model,
+            effort: body.effort || body.metadata?.effort || prefs.defaultEffort,
+            agent,
+            conversationId: body.conversation_id || body.metadata?.conversation_id,
+            continueLast: Boolean(body.continue || body.metadata?.continue),
+            printTimeout: body.print_timeout,
+            timeoutMs: body.timeout_ms,
+            mode: body.mode || body.metadata?.mode,
+          },
+          (evt) => {
+            if (!stream || evt.type !== "text_delta" || !evt.text_delta) return;
+            streamed += evt.text_delta;
+            res.write(chunk({ content: evt.text_delta }));
+          }
+        );
+      } catch (err) {
+        finished = true;
+        if (ping) clearInterval(ping);
+        if (!stream) throw err;
+        res.write(`data: ${JSON.stringify({ error: { message: err.message, code: err.code || "AGY_ERROR" } })}\n\n`);
+        return res.end();
+      }
+      finished = true;
+      if (ping) clearInterval(ping);
+      try {
+        recordLocalUsage({ model, usage: summary.usage, conversationId: summary.conversationId });
       } catch {
         /* ignore */
       }
-      return sendJson(
-        res,
-        200,
-        openaiChatResponse({
-          model: model || body.model || "antigravity",
-          content: result.response ?? result.stdout,
-          usage: result.usage,
-        })
-      );
+      const content = summary.response ?? streamed;
+      if (summary.status === "ERROR" && !content) {
+        const message = summary.stderr?.trim().slice(0, 500) || "agy returned an error";
+        if (!stream) return sendJson(res, 502, { error: { message, code: "AGY_ERROR" } });
+        res.write(`data: ${JSON.stringify({ error: { message, code: "AGY_ERROR" } })}\n\n`);
+        return res.end();
+      }
+      if (!stream) {
+        return sendJson(res, 200, openaiChatResponse({ id, model: modelName, content, usage: summary.usage }));
+      }
+      if (content && content.length > streamed.length && content.startsWith(streamed)) {
+        res.write(chunk({ content: content.slice(streamed.length) }));
+      } else if (!streamed && content) {
+        res.write(chunk({ content }));
+      }
+      res.write(chunk({}, "stop"));
+      res.write("data: [DONE]\n\n");
+      return res.end();
     }
 
     sendJson(res, 404, { error: { message: `Not found: ${url.pathname}` } });
