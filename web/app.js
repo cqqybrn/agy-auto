@@ -585,6 +585,19 @@
     return baseName(p) || p;
   }
 
+  function isToolOutputText(text) {
+    if (typeof text !== "string") return false;
+    const t = text.trim();
+    return (
+      (t.startsWith("Created At:") &&
+        (t.includes("The command exited with code") ||
+          t.includes("Output:") ||
+          t.includes("Completed At:"))) ||
+      t.startsWith("Tool is running as a background task") ||
+      t.startsWith("The following is a <SYSTEM_MESSAGE>")
+    );
+  }
+
   function loadConvs() {
     const arr = LS.get("agy.convs", []);
     if (!Array.isArray(arr)) return [];
@@ -604,6 +617,9 @@
           t.blocks.push({ kind: "system", key: uid("s"), text: "页面刷新或关闭，本次运行已中断。" });
         }
         for (const b of t.blocks || []) if (b && b.state === "running") b.state = "stopped";
+        if (Array.isArray(t.blocks)) {
+          t.blocks = t.blocks.filter((b) => !(b.kind === "text" && isToolOutputText(b.text)));
+        }
       }
     }
     return arr;
@@ -1673,6 +1689,7 @@
     }
     switch (b.kind) {
       case "text":
+        if (isToolOutputText(b.text)) return h("div", { style: "display:none" });
         return h("div", { class: "blk-text" }, h("div", { class: "md", html: md(b.text) }));
       case "tool":
         return buildTool(turn, b);
@@ -2274,7 +2291,7 @@
           }
         }
         const text = d.text_delta || d.content || d.text || d.response;
-        if (text && typeof text === "string" && text.trim()) {
+        if (text && typeof text === "string" && text.trim() && !isToolOutputText(text)) {
           const key = si != null ? `t${si}` : uid("t");
           upsertBlock(turn, key, "text", (b) => {
             b.text = text;
@@ -2284,7 +2301,7 @@
       }
       case "text_delta": {
         const text = d.text_delta ?? d.content ?? d.text ?? "";
-        if (!text) break;
+        if (!text || isToolOutputText(text)) break;
         const last = turn.blocks[turn.blocks.length - 1];
         const key = si != null ? `t${si}` : last?.kind === "text" ? last.key : uid("t");
         upsertBlock(turn, key, "text", (b) => {
@@ -2506,10 +2523,16 @@
           }
         }
 
+        // Clean any leaking tool output text blocks
+        if (Array.isArray(t.blocks)) {
+          t.blocks = t.blocks.filter((b) => !(b.kind === "text" && isToolOutputText(b.text)));
+        }
+
         // Restore or update response text from transcript
         const textSteps = part.filter((s) =>
           /planner_response|agent_response|model_response|text/i.test(`${s.type || ""}`) &&
-          s.content && typeof s.content === "string" && s.content.trim()
+          s.content && typeof s.content === "string" && s.content.trim() &&
+          !isToolOutputText(s.content)
         );
         if (textSteps.length > 0) {
           for (const ts of textSteps) {
@@ -2529,7 +2552,8 @@
         } else {
           const lastModel = [...part].reverse().find((s) =>
             s.content && typeof s.content === "string" && s.content.trim() &&
-            !/generic|system_message|tool_output|user_input/i.test(`${s.type || ""}`)
+            !/generic|system_message|tool_output|user_input/i.test(`${s.type || ""}`) &&
+            !isToolOutputText(s.content)
           );
           if (lastModel?.content) {
             if (!t.blocks) t.blocks = [];

@@ -204,6 +204,19 @@ export function runAgy(options = {}) {
   });
 }
 
+function isToolOutputText(text) {
+  if (typeof text !== "string") return false;
+  const t = text.trim();
+  return (
+    (t.startsWith("Created At:") &&
+      (t.includes("The command exited with code") ||
+        t.includes("Output:") ||
+        t.includes("Completed At:"))) ||
+    t.startsWith("Tool is running as a background task") ||
+    t.startsWith("The following is a <SYSTEM_MESSAGE>")
+  );
+}
+
 /**
  * Normalize agy stream-json events into frontend-friendly SSE payloads.
  */
@@ -265,7 +278,9 @@ export function normalizeStreamEvent(raw) {
       };
     }
     const respText = s.text_delta ?? s.content ?? s.response ?? s.text ?? null;
+    const isToolOutput = isToolOutputText(respText);
     if (
+      !isToolOutput &&
       (s.step_type === "agent_response" ||
         s.step_type === "planner_response" ||
         s.step_type === "model_response" ||
