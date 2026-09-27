@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -14,12 +13,12 @@ import {
   invalidateWhoamiCache,
 } from "./accounts.js";
 import { readJson, writeJson, resolveAgyBinary, extractOauthClientFromBinary } from "./utils.js";
+import { proxyFetch } from "./httpProxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
 const WINCRED_PS1 = path.join(ROOT, "scripts", "wincred.ps1");
 const OAUTH_CLIENT_CACHE = path.join(ROOT, "accounts", "oauth-client.json");
-const OAUTH_CHROME_PROFILE = path.join(ROOT, ".agy-oauth-chrome");
 
 const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
@@ -41,18 +40,14 @@ const SCOPES = [
  * @property {string} challenge
  * @property {number} createdAt
  * @property {string|null} beforeEmail
- * @property {string} status  pending|browser_opened|waiting_auth|capturing|done|error
+ * @property {string} status
  * @property {string|null} error
  * @property {object|null} result
- * @property {number|null} chromePid
- * @property {number|null} debugPort
  * @property {string|null} authUrl
- * @property {boolean} auto
  */
 
 /** @type {Map<string, OAuthSession>} */
 const pending = new Map();
-
 
 function resolveOauthClient() {
   const fromEnv = {
@@ -84,27 +79,6 @@ function resolveOauthClient() {
   }
   throw new Error("无法解析 Antigravity OAuth client，请确认已安装 agy");
 }
-
-function findChrome() {
-  const candidates = [
-    process.env.CHROME_PATH,
-    process.env.AGY_CHROME_PATH,
-    path.join(process.env.PROGRAMFILES || "", "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(process.env["PROGRAMFILES(X86)"] || "", "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
-    path.join(process.env.PROGRAMFILES || "", "Microsoft", "Edge", "Application", "msedge.exe"),
-    path.join(process.env["PROGRAMFILES(X86)"] || "", "Microsoft", "Edge", "Application", "msedge.exe"),
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/usr/bin/google-chrome",
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-  ].filter(Boolean);
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
-  }
-  return null;
-}
-
 
 function b64url(buf) {
   return Buffer.from(buf)
@@ -162,184 +136,8 @@ function purgeStalePending() {
   const now = Date.now();
   for (const [k, v] of pending) {
     if (now - v.createdAt > 15 * 60 * 1000) {
-      tryKillChrome(v);
       pending.delete(k);
     }
-  }
-}
-
-function tryKillChrome(session) {
-  if (!session?.chromePid) return;
-  try {
-    if (process.platform === "win32") {
-      spawnSync("taskkill", ["/PID", String(session.chromePid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-    } else {
-      process.kill(session.chromePid, "SIGTERM");
-    }
-  } catch {
-    /* ignore */
-  }
-  session.chromePid = null;
-}
-
-function getFreePort() {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const addr = s.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      s.close((err) => (err ? reject(err) : resolve(port)));
-    });
-    s.on("error", reject);
-  });
-}
-
-async function waitForCdp(port, timeoutMs = 20000) {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
-        signal: AbortSignal.timeout(1500),
-      });
-      if (res.ok) return await res.json();
-    } catch {
-      /* retry */
-    }
-    await new Promise((r) => setTimeout(r, 250));
-  }
-  throw new Error("Chrome 调试端口未就绪");
-}
-
-async function listCdpPages(port) {
-  const res = await fetch(`http://127.0.0.1:${port}/json/list`, {
-    signal: AbortSignal.timeout(2000),
-  });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return Array.isArray(data) ? data : [];
-}
-
-function codeFromUrl(urlStr) {
-  if (!urlStr || !/oauth-callback/i.test(urlStr)) return null;
-  try {
-    // UIA sometimes returns host/path without scheme
-    const raw = /^(https?:)?\/\//i.test(urlStr) ? urlStr : `https://${urlStr.replace(/^\/+/, "")}`;
-    const u = new URL(raw);
-    const code = u.searchParams.get("code");
-    if (code) return code;
-    if (u.hash) {
-      const h = new URLSearchParams(u.hash.replace(/^#/, ""));
-      return h.get("code");
-    }
-  } catch {
-    /* ignore */
-  }
-  const m = String(urlStr).match(/[?&#]code=([^&#]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
-}
-
-function codeFromPageText(text) {
-  if (!text) return null;
-  const cleaned = String(text).replace(/\s+/g, " ").trim();
-  // Prefer explicit labels (official Antigravity callback page)
-  const labeled =
-    cleaned.match(/Paste this code[\s\S]{0,120}?((?:4\/|1\/)[0-9A-Za-z\-_]{20,})/i) ||
-    cleaned.match(/complete authentication[:\s]+((?:4\/|1\/)[0-9A-Za-z\-_]{20,})/i) ||
-    cleaned.match(/authorization code[:\s]+([A-Za-z0-9_/\-.+]{20,})/i) ||
-    cleaned.match(/授权码[:\s：]+([A-Za-z0-9_/\-.+]{20,})/i) ||
-    cleaned.match(/code[:\s]+([4/][A-Za-z0-9_/\-.+]{20,})/i);
-  if (labeled) return labeled[1].replace(/[.,;]+$/, "");
-
-  // Google auth codes often start with 4/
-  const google = cleaned.match(/\b(4\/[0-9A-Za-z\-_]{20,})\b/);
-  if (google) return google[1];
-
-  // Long opaque token on its own line-ish
-  const long = cleaned.match(/\b([A-Za-z0-9_/\-+.]{40,})\b/);
-  return long ? long[1] : null;
-}
-
-async function cdpEvaluate(wsUrl, expression) {
-  const ws = new WebSocket(wsUrl);
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("CDP websocket timeout")), 8000);
-    ws.addEventListener("open", () => {
-      clearTimeout(t);
-      resolve();
-    });
-    ws.addEventListener("error", (e) => {
-      clearTimeout(t);
-      reject(e);
-    });
-  });
-
-  const id = Math.floor(Math.random() * 1e9);
-  const result = await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("CDP evaluate timeout")), 8000);
-    ws.addEventListener("message", (ev) => {
-      try {
-        const msg = JSON.parse(String(ev.data));
-        if (msg.id !== id) return;
-        clearTimeout(t);
-        if (msg.error) reject(new Error(msg.error.message || "CDP error"));
-        else resolve(msg.result);
-      } catch (err) {
-        clearTimeout(t);
-        reject(err);
-      }
-    });
-    ws.send(
-      JSON.stringify({
-        id,
-        method: "Runtime.evaluate",
-        params: {
-          expression,
-          returnByValue: true,
-          awaitPromise: true,
-        },
-      })
-    );
-  });
-
-  try {
-    ws.close();
-  } catch {
-    /* ignore */
-  }
-  return result?.result?.value ?? null;
-}
-
-async function extractCodeFromCallbackPage(page) {
-  const fromUrl = codeFromUrl(page.url);
-  if (fromUrl) return fromUrl;
-
-  if (!page.webSocketDebuggerUrl) return null;
-  try {
-    const text = await cdpEvaluate(
-      page.webSocketDebuggerUrl,
-      `(() => {
-        const pick = (sel) => {
-          const el = document.querySelector(sel);
-          if (!el) return null;
-          return (el.value || el.textContent || el.innerText || '').trim();
-        };
-        return (
-          pick('input[readonly]') ||
-          pick('input[type="text"]') ||
-          pick('code') ||
-          pick('pre') ||
-          pick('[data-code]') ||
-          (document.body && (document.body.innerText || document.body.textContent)) ||
-          ''
-        );
-      })()`
-    );
-    return codeFromPageText(text);
-  } catch {
-    return null;
   }
 }
 
@@ -370,238 +168,63 @@ function snapshotCurrentIfNeeded({ saveCurrentAs, skipSaveCurrent }) {
   return { before, savedCurrent };
 }
 
-function openInExistingChrome(url) {
-  // Open in a NEW Chrome window so the OAuth callback keeps its own window title
-  // ("Google Antigravity Authentication") and is easy to find via UI Automation.
-  // Do NOT set --user-data-dir — that would spawn a blank profile.
-  const chrome = findChrome();
-  if (chrome) {
-    try {
-      const child = spawn(chrome, ["--new-window", url], {
-        detached: true,
-        stdio: "ignore",
-        windowsHide: false,
-      });
-      child.unref();
-      return true;
-    } catch {
-      /* fall through */
-    }
-  }
-  openSystemBrowser(url);
-  return false;
-}
-
-function runPsAsync(args, timeoutMs = 8000) {
-  return new Promise((resolve) => {
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", ...args], {
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    let out = "";
-    const timer = setTimeout(() => {
-      try { child.kill(); } catch {}
-      resolve("");
-    }, timeoutMs);
-    child.stdout.on("data", (c) => { out += c; });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve(code === 0 ? out.trim() : "");
-    });
-    child.on("error", () => {
-      clearTimeout(timer);
-      resolve("");
-    });
-  });
-}
-
-async function readSystemClipboard() {
-  try {
-    if (process.platform === "win32") {
-      const out = await runPsAsync(
-        ["-Command", "try { Get-Clipboard -Raw } catch { '' }"],
-        4000
-      );
-      return String(out || "").trim();
-    }
-    if (process.platform === "darwin") {
-      const r = spawnSync("pbpaste", [], { encoding: "utf8", timeout: 3000 });
-      return String(r.stdout || "").trim();
-    }
-    const r = spawnSync("xclip", ["-selection", "clipboard", "-o"], {
-      encoding: "utf8",
-      timeout: 3000,
-    });
-    return String(r.stdout || "").trim();
-  } catch {
-    return "";
-  }
-}
-
-function looksLikeAuthCode(text) {
-  const t = String(text || "").trim().replace(/\s+/g, "");
-  if (t.length < 20 || t.length > 2048) return false;
-  if (/^https?:\/\//i.test(t)) return false;
-  if (/^(4\/|1\/)/.test(t)) return true;
-  // opaque oauth codes
-  return /^[A-Za-z0-9_/\-.+=]+$/.test(t) && t.length >= 30;
-}
-
-async function readChromeUrls() {
-  try {
-    const script = path.join(ROOT, "scripts", "chrome-urls.ps1");
-    if (!fs.existsSync(script)) return [];
-    const out = await runPsAsync(["-File", script], 8000);
-    if (!out) return [];
-    if (out.startsWith("所在位置") || out.includes("ParserError")) return [];
-    const parsed = JSON.parse(out);
-    if (Array.isArray(parsed)) return parsed.map(String);
-    if (typeof parsed === "string") return [parsed];
-    return [];
-  } catch {
-    return [];
-  }
-}
-
 /**
- * Focus OAuth Chrome window briefly and Ctrl+L / Ctrl+C to copy the address bar.
- * Needed because Chrome often hides the omnibox URL from UI Automation.
+ * Extract clean OAuth authorization code from text (raw code, full callback URL, or copied page snippet).
  */
-async function copyOmniboxUrlViaHotkey() {
-  try {
-    const script = path.join(ROOT, "scripts", "chrome-omnibox-copy.ps1");
-    if (!fs.existsSync(script)) return "";
-    const out = await runPsAsync(["-File", script], 8000);
-    return String(out || "").trim();
-  } catch {
-    return "";
-  }
-}
-
-async function readAuthPageText() {
-  try {
-    const script = path.join(ROOT, "scripts", "chrome-page-text.ps1");
-    if (!fs.existsSync(script)) return "";
-    const out = await runPsAsync(["-File", script], 8000);
-    return String(out || "").trim();
-  } catch {
-    return "";
-  }
-}
-
 export function extractCodeFromText(text) {
   if (!text) return null;
   const str = String(text).trim();
-  const m = str.match(/[?&#]code=([^&#\s]+)/i);
-  if (m?.[1]) {
+
+  // 1) URL with code query param: ?code=... or &code=... or #code=...
+  const urlParamMatch = str.match(/[?&#]code=([^&#\s]+)/i);
+  if (urlParamMatch?.[1]) {
     try {
-      return decodeURIComponent(m[1]).trim();
+      return decodeURIComponent(urlParamMatch[1]).trim();
     } catch {
-      return m[1].trim();
+      return urlParamMatch[1].trim();
     }
   }
-  return (
-    codeFromUrl(str) ||
-    codeFromPageText(str) ||
-    (looksLikeAuthCode(str) ? str.replace(/\s+/g, "") : null)
-  );
-}
 
-/**
- * Watch Chrome address bar + clipboard + page text after authorize.
- * Uses the user's normal Chrome (Google accounts already signed in).
- */
-async function autoCaptureLoop(state) {
-  const session = pending.get(state);
-  if (!session) return;
-  session.status = "waiting_auth";
-  session.hint = "waiting_browser";
-  session.lastError = null;
-  const deadline = Date.now() + 10 * 60 * 1000;
-  const seenCodes = new Set();
-  let lastOmniboxTry = 0;
-  let emptyStreak = 0;
-
-  while (Date.now() < deadline) {
-    const cur = pending.get(state);
-    if (!cur || cur.status === "done" || cur.status === "error") return;
-
+  // 2) Callback URL without scheme or full URL
+  if (/oauth-callback/i.test(str)) {
     try {
-      const candidates = [];
-
-      // 1) Address bars (may strip ?code=; still useful for detecting callback page)
-      const urls = await readChromeUrls();
-      for (const u of urls) {
-        const c = extractCodeFromText(u);
-        if (c) candidates.push(c);
-      }
-
-      // 2) Clipboard
-      const clip = await readSystemClipboard();
-      if (clip) {
-        const c = extractCodeFromText(clip);
-        if (c) candidates.push(c);
-      }
-
-      // 3) Callback page text (code is shown on page: "Paste this code…")
-      const pageText = await readAuthPageText();
-      if (pageText) {
-        const c = extractCodeFromText(pageText);
-        if (c) candidates.push(c);
-        if (/Paste this code|Authentication/i.test(pageText)) {
-          cur.hint = "capturing_url";
-        }
-      }
-
-      if (!candidates.length) {
-        emptyStreak += 1;
-        if (emptyStreak >= 5) cur.hint = "need_callback_tab";
-      } else {
-        emptyStreak = 0;
-      }
-
-      for (const code of candidates) {
-        if (!code || seenCodes.has(code)) continue;
-        seenCodes.add(code);
-        cur.status = "exchanging";
-        cur.hint = "exchanging";
-        try {
-          const result = await finishBrowserOAuth({ state, code });
-          cur.status = "done";
-          cur.result = result;
-          cur.hint = "done";
-          cur.lastError = null;
-          return;
-        } catch (err) {
-          cur.status = "waiting_auth";
-          cur.hint = "exchange_failed";
-          cur.lastError = err.message || String(err);
-        }
-      }
-    } catch (err) {
-      const cur2 = pending.get(state);
-      if (cur2) cur2.lastError = err.message || String(err);
+      const raw = /^(https?:)?\/\//i.test(str) ? str : `https://${str.replace(/^\/+/, "")}`;
+      const u = new URL(raw);
+      const code = u.searchParams.get("code");
+      if (code) return code.trim();
+    } catch {
+      /* ignore */
     }
-    await new Promise((r) => setTimeout(r, 2500));
   }
 
-  const cur = pending.get(state);
-  if (cur && cur.status !== "done") {
-    cur.status = "error";
-    cur.error = cur.lastError || cur.error || "添加超时：未读到授权码，请保持授权完成页打开后重试";
-    cur.hint = "error";
+  // 3) Explicit code patterns: e.g. "Paste this code...", "4/0A..."
+  const labeled =
+    str.match(/Paste this code[\s\S]{0,120}?((?:4\/|1\/)[0-9A-Za-z\-_]{20,})/i) ||
+    str.match(/authorization code[:\s]+([A-Za-z0-9_/\-.+]{20,})/i) ||
+    str.match(/授权码[:\s：]+([A-Za-z0-9_/\-.+]{20,})/i);
+  if (labeled?.[1]) return labeled[1].replace(/[.,;]+$/, "").trim();
+
+  // 4) Google auth code starting with 4/ or 1/
+  const googleMatch = str.match(/\b([41]\/[0-9A-Za-z\-_]{20,})\b/);
+  if (googleMatch?.[1]) return googleMatch[1].trim();
+
+  // 5) Clean standalone code token (at least 20 chars, no http prefix, valid base64/url chars)
+  const cleaned = str.replace(/\s+/g, "");
+  if (cleaned.length >= 20 && !/^https?:\/\//i.test(cleaned) && /^[A-Za-z0-9_/\-.+=]+$/.test(cleaned)) {
+    return cleaned;
   }
+
+  return null;
 }
 
 /**
- * Start browser OAuth in the user's normal Chrome (keeps Google login sessions).
- * Auto-finishes when the auth code is copied from the official callback page.
+ * Start browser OAuth flow: generates PKCE pair and authorization URL.
+ * Automatically snapshots current account and opens browser if open is true.
  */
 export function startBrowserOAuth({
   saveCurrentAs,
   skipSaveCurrent = false,
   open = true,
-  auto = true,
 } = {}) {
   purgeStalePending();
 
@@ -626,51 +249,36 @@ export function startBrowserOAuth({
     challenge,
     createdAt: Date.now(),
     beforeEmail: null,
-    status: "pending",
+    status: "waiting_code",
     error: null,
     result: null,
-    chromePid: null,
-    debugPort: null,
     authUrl: url.toString(),
-    auto: Boolean(auto),
-    hint: "pending",
   };
   pending.set(state, session);
 
-  // Run snapshotting, browser opening, and auto-capture in the background without blocking the HTTP response
-  setImmediate(() => {
+  // Snapshot current account
+  try {
+    const { before } = snapshotCurrentIfNeeded({ saveCurrentAs, skipSaveCurrent });
+    session.beforeEmail = before?.email || null;
+  } catch {
+    /* ignore */
+  }
+
+  // Open browser window if requested
+  if (open) {
     try {
-      const { before } = snapshotCurrentIfNeeded({ saveCurrentAs, skipSaveCurrent });
-      session.beforeEmail = before?.email || null;
-    } catch { /* ignore */ }
-
-    if (open) {
-      session.status = "browser_opened";
-      try {
-        openInExistingChrome(url.toString());
-      } catch { /* ignore */ }
+      openSystemBrowser(url.toString());
+    } catch {
+      /* ignore */
     }
-
-    if (auto) {
-      autoCaptureLoop(state).catch((err) => {
-        const cur = pending.get(state);
-        if (cur && cur.status !== "done") {
-          cur.status = "error";
-          cur.error = err.message || String(err);
-        }
-      });
-    } else {
-      session.status = "waiting_auth";
-    }
-  });
+  }
 
   return {
     ok: true,
     state,
     authUrl: url.toString(),
     redirectUri: REDIRECT_URI,
-    auto: Boolean(auto),
-    hint: "",
+    hint: "请在打开的页面登录授权，并复制返回的授权码粘贴回此处提交。",
   };
 }
 
@@ -684,11 +292,9 @@ export function getOAuthStatus(state) {
     ok: true,
     state,
     status: session.status,
-    error: session.error || session.lastError || null,
+    error: session.error || null,
     result: session.result,
-    auto: session.auto,
     beforeEmail: session.beforeEmail,
-    hint: session.hint || null,
   };
 }
 
@@ -706,14 +312,16 @@ function buildCredBlobFromTokenResponse(data) {
   };
 }
 
-/** Exchange authorization code and save as a named profile. */
+/**
+ * Exchange authorization code and save as a named profile.
+ */
 export async function finishBrowserOAuth({ state, code, name } = {}) {
   if (!code || typeof code !== "string") {
-    throw Object.assign(new Error("code required"), { code: "BAD_REQUEST" });
+    throw Object.assign(new Error("请先输入或粘贴授权码"), { code: "BAD_REQUEST" });
   }
   const extracted = extractCodeFromText(code);
   const cleaned = (extracted || code).trim().replace(/\s+/g, "");
-  if (!cleaned) throw Object.assign(new Error("empty code"), { code: "BAD_REQUEST" });
+  if (!cleaned) throw Object.assign(new Error("授权码为空，请重新粘贴"), { code: "BAD_REQUEST" });
 
   purgeStalePending();
   let session = state ? pending.get(state) : null;
@@ -723,12 +331,11 @@ export async function finishBrowserOAuth({ state, code, name } = {}) {
     session = pending.get(sessionKey);
   }
   if (!session) {
-    throw Object.assign(new Error("登录会话已过期，请重新点「添加账号」"), {
+    throw Object.assign(new Error("登录会话已过期或不存在，请重新点击「添加账号」"), {
       code: "SESSION_EXPIRED",
     });
   }
 
-  // Keep session in map until success so status polling still works; delete after
   const { client_id, client_secret } = resolveOauthClient();
   const body = new URLSearchParams({
     client_id,
@@ -739,20 +346,52 @@ export async function finishBrowserOAuth({ state, code, name } = {}) {
     redirect_uri: REDIRECT_URI,
   });
 
-  const res = await fetch(TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body,
-  });
-  const raw = await res.text();
+  let res;
+  let raw = "";
+  try {
+    res = await proxyFetch(TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      timeoutMs: 30000,
+    });
+    raw = await res.text();
+  } catch (netErr) {
+    throw Object.assign(new Error(`连接 Google 换票服务器失败：${netErr.message}，请检查网络或系统代理 (127.0.0.1:10809)`), {
+      code: "NETWORK_ERROR",
+    });
+  }
+
   if (!res.ok) {
-    throw Object.assign(new Error(`换取 token 失败：${res.status} ${raw.slice(0, 240)}`), {
+    let detail = "";
+    try {
+      const errJson = JSON.parse(raw);
+      detail = errJson.error_description || errJson.error || "";
+    } catch {
+      detail = raw.slice(0, 200);
+    }
+
+    let userHint = `换取 Token 失败 (HTTP ${res.status})`;
+    if (detail) userHint += `：${detail}`;
+    if (raw.includes("invalid_grant")) {
+      userHint += "。提示：授权码是一次性的且有效期较短，已失效或已被使用；请重新点击「添加账号」打开授权页并复制最新的授权码。";
+    }
+    throw Object.assign(new Error(userHint), {
       code: "TOKEN_EXCHANGE_FAILED",
     });
   }
-  const data = JSON.parse(raw);
+
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw Object.assign(new Error("Google Token 响应格式异常"), {
+      code: "TOKEN_PARSE_FAILED",
+    });
+  }
+
   if (!data.access_token) {
-    throw Object.assign(new Error("token 响应缺少 access_token"), {
+    throw Object.assign(new Error("Google 响应中未包含 access_token"), {
       code: "TOKEN_EXCHANGE_FAILED",
     });
   }
@@ -779,21 +418,20 @@ export async function finishBrowserOAuth({ state, code, name } = {}) {
   const saved = saveAccount(profileName);
   session.status = "done";
   session.result = { ok: true, ...saved };
-  tryKillChrome(session);
-  // Keep briefly for status poll, then drop
-  setTimeout(() => pending.delete(sessionKey), 30_000);
+
+  // Remove used session
+  pending.delete(sessionKey);
 
   return {
     ok: true,
     ...saved,
-    hint: "已写入 Windows 凭据并保存档案，可直接切换使用。",
+    hint: "已成功写入凭据并保存档案，可直接切换使用。",
   };
 }
 
 export function getOAuthHint() {
   return {
     redirectUri: REDIRECT_URI,
-    autoCapture: "clipboard",
-    note: "在你本机已登录的 Chrome 里打开授权；授权后复制回调页授权码即可自动完成（也可手动粘贴）。",
+    note: "在浏览器中登录授权后，复制页面上的授权码并粘贴回此处提交。",
   };
 }

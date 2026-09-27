@@ -2420,12 +2420,17 @@
       if (!conv.turns) conv.turns = [];
       const turns = conv.turns;
 
-      // Group transcript steps by USER_INPUT
+      // Group transcript steps by genuine USER_INPUT
       const partitions = [];
       let cur = [];
       for (const s of data.steps) {
-        if (/user_input|user/i.test(`${s.type || ""} ${s.source || ""}`)) {
-          if (cur.length > 0) partitions.push(cur);
+        const typeStr = String(s.type || "");
+        const srcStr = String(s.source || "");
+        const isUserTurn =
+          /^user_input$/i.test(typeStr) ||
+          (/user_input/i.test(typeStr) && /user/i.test(srcStr));
+        if (isUserTurn && cur.length > 0 && cur.some((x) => /^user_input$/i.test(String(x.type || "")))) {
+          partitions.push(cur);
           cur = [s];
         } else {
           cur.push(s);
@@ -2434,11 +2439,12 @@
       if (cur.length > 0) partitions.push(cur);
       if (!partitions.length) return;
 
+      const hasLiveTurn = turns.some((t) => t.status === "running");
       let needRerender = false;
-      if (partitions.length > turns.length) {
+      if (partitions.length > turns.length && !hasLiveTurn) {
         for (let pi = turns.length; pi < partitions.length; pi++) {
           const p = partitions[pi];
-          const userStep = p.find((s) => /user_input|user/i.test(`${s.type || ""} ${s.source || ""}`));
+          const userStep = p.find((s) => /^user_input$/i.test(String(s.type || "")));
           const rawPrompt = userStep?.content || "";
           const cleanPrompt = cleanUserPrompt(rawPrompt) || (pi === 0 ? conv.title : "用户输入");
           turns.push({
@@ -2458,7 +2464,7 @@
       for (let i = 0; i < turns.length; i++) {
         const t = turns[i];
         if (targetTurn && t !== targetTurn && (t.thoughts || t.thinking)) continue;
-        const part = partitions[i] || (i === turns.length - 1 ? partitions[partitions.length - 1] : null);
+        const part = partitions[i];
         if (!part) continue;
 
         const thoughts = [];
@@ -2531,6 +2537,12 @@
           t.blocks = t.blocks.filter((b) => !(b.kind === "text" && isToolOutputText(b.text)));
         }
 
+        // If the turn is actively running via SSE, live stream is already receiving and painting
+        // text deltas in real-time. Do not inject or overwrite text blocks from transcript poller.
+        if (t.status === "running") {
+          continue;
+        }
+
         // Restore or update response text from transcript
         const textSteps = part.filter((s) =>
           /planner_response|agent_response|model_response|text/i.test(`${s.type || ""}`) &&
@@ -2575,7 +2587,7 @@
       }
       if (updated || needRerender) {
         scheduleSave();
-        if (needRerender && conv.id === state.activeId) renderThread();
+        if (needRerender && conv.id === state.activeId && !hasLiveTurn) renderThread();
       }
     } catch {
       // Non-fatal background fetch
@@ -3314,22 +3326,28 @@
   }
 
   function paintAddUi() {
-    const { status, btn, statusText } = addUi;
+    const { status, btn } = addUi;
     if (btn) {
       const busy = addFlow.phase === "busy";
       btn.disabled = busy;
       btn.classList.toggle("busy", busy);
-      if (btn.tagName === "BUTTON" && btn.id === "mainAddBtn") {
+      if (btn.tagName === "BUTTON") {
         btn.replaceChildren();
-        if (busy) btn.appendChild(h("span", { class: "spin" }));
-        else if (addFlow.phase === "ok") btn.appendChild(icon("check"));
-        else if (addFlow.phase === "err") btn.appendChild(icon("alert"));
-        else btn.appendChild(icon("plus"));
-        btn.appendChild(document.createTextNode(addFlow.btnLabel || "添加账号 (Google OAuth)"));
+        if (btn.id === "mainAddBtn") {
+          if (busy) btn.appendChild(h("span", { class: "spin" }));
+          else if (addFlow.phase === "ok") btn.appendChild(icon("check"));
+          else if (addFlow.phase === "err") btn.appendChild(icon("alert"));
+          else btn.appendChild(icon("plus"));
+          btn.appendChild(document.createTextNode(addFlow.btnLabel || "添加账号 (Google OAuth)"));
+        } else {
+          if (busy) {
+            btn.appendChild(h("span", { class: "spin" }));
+            btn.appendChild(document.createTextNode(" 换取中…"));
+          } else {
+            btn.appendChild(document.createTextNode("提交"));
+          }
+        }
       }
-    }
-    if (statusText) {
-      statusText.textContent = addFlow.text || "等待授权…";
     }
     if (status) {
       status.className = "acct-add-status" + (addFlow.phase ? ` ${addFlow.phase}` : "");
@@ -3346,14 +3364,10 @@
   function setAddProgress(phase, text) {
     addFlow.phase = phase || "";
     addFlow.text = text || "";
-    addFlow.active = phase === "busy" || Boolean(addFlow.authUrl);
     if (phase === "busy") addFlow.btnLabel = text || "添加中…";
     else if (phase === "ok") addFlow.btnLabel = "添加成功";
     else if (phase === "err") addFlow.btnLabel = "添加失败，重试";
-    else {
-      addFlow.btnLabel = "添加账号";
-      addFlow.active = false;
-    }
+    else addFlow.btnLabel = "添加账号";
     paintAddUi();
   }
 
@@ -3377,18 +3391,17 @@
       toast("未能提取到有效授权码", true);
       return;
     }
-    setAddProgress("busy", "正在保存账号…");
+    setAddProgress("busy", "正在向 Google 换取 Token 并保存账号…");
     try {
       const r = await api("/v1/accounts/oauth/finish", {
         method: "POST",
         body: { state: addFlow.state, code },
-        timeoutMs: 30000,
+        timeoutMs: 35000,
       });
       finishAddSuccess(r.email || r.name);
     } catch (err) {
       setAddProgress("err", `换票失败：${err.message}`);
       toast(`换票失败：${err.message}`, true);
-      paintAddUi();
     }
   }
 
@@ -3437,11 +3450,10 @@
     const addCard = h("div", { class: "card acct-add" });
     if (addFlow.active) {
       const busy = addFlow.phase === "busy";
-      const statusText = h("strong", { style: "font-size:13px", text: addFlow.text || "等待授权…" });
-      const head = h("div", { class: "row center", style: "justify-content:space-between; margin-bottom:6px" },
+      const head = h("div", { class: "row center", style: "justify-content:space-between; margin-bottom:8px" },
         h("div", { class: "row gap-xs center" },
-          busy ? h("span", { class: "spin", style: "width:13px; height:13px" }) : (addFlow.phase === "ok" ? icon("check") : icon("alert")),
-          statusText
+          busy ? h("span", { class: "spin", style: "width:13px; height:13px" }) : (addFlow.phase === "ok" ? icon("check") : (addFlow.phase === "err" ? icon("alert") : icon("key"))),
+          h("strong", { style: "font-size:13px", text: "手动提交 Google 授权码" })
         ),
         h("button", {
           class: "btn sm",
@@ -3453,81 +3465,57 @@
         }, "取消")
       );
 
-      const hint = h("div", { class: "acct-add-hint", style: "margin:4px 0 8px; font-size:12px; line-height:1.5" },
-        "已发起 Google OAuth 授权。授权完成后，系统会自动捕获授权码。若未自动跳转，可直接复制授权码或回调网址粘贴至下方："
+      const hint = h("div", { class: "acct-add-hint", style: "margin:4px 0 10px; font-size:12px; line-height:1.6; color:var(--text-dim)" },
+        h("div", {}, "1. 在打开的 Google 页面登录并完成授权；"),
+        h("div", {}, "2. 页面会显示「Paste this code to complete authentication」及授权码（或跳转至回调网址）；"),
+        h("div", {}, "3. 复制该授权码（或完整网址），粘贴至下方输入框并点击「提交」。")
       );
 
-      const actionRow = h("div", { class: "col gap-xs", style: "margin: 8px 0" },
+      const actionRow = h("div", { class: "row gap-xs", style: "margin-bottom:8px" },
         addFlow.authUrl ? h("a", {
-          class: "btn primary",
+          class: "btn sm primary grow",
           href: addFlow.authUrl,
           target: "_blank",
           rel: "noopener noreferrer",
-          style: "width:100%; text-align:center; text-decoration:none; display:flex; align-items:center; justify-content:center; gap:6px",
-        }, icon("external-link"), "点击打开 Google 授权窗口") : null,
-        h("div", { class: "row gap-xs" },
-          addFlow.authUrl ? h("button", {
-            class: "btn sm grow",
-            type: "button",
-            onclick: () => {
-              copyText(addFlow.authUrl);
-              toast("已复制授权链接");
-            },
-          }, "复制授权链接") : null,
-          h("button", {
-            class: "btn sm",
-            type: "button",
-            onclick: () => {
-              resetAddFlow();
-              renderAccounts();
-            },
-          }, "取消")
-        )
+          style: "text-align:center; text-decoration:none; display:flex; align-items:center; justify-content:center; gap:6px",
+        }, icon("external-link"), "重新打开 Google 授权窗口") : null,
+        addFlow.authUrl ? h("button", {
+          class: "btn sm",
+          type: "button",
+          onclick: () => {
+            copyText(addFlow.authUrl);
+            toast("已复制授权链接");
+          },
+        }, "复制授权链接") : null
       );
 
       const codeIn = h("input", {
         class: "field mono grow",
         type: "text",
-        placeholder: "在此粘贴授权码 (4/0A...) 或完整回调 URL",
+        placeholder: "在此粘贴授权码 (以 4/ 开头) 或完整回调 URL",
         autocomplete: "off",
+        autofocus: true,
       });
       codeIn.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") {
+        if (e.key === "Enter" && !busy) {
           e.preventDefault();
           submitManualOAuthCode(codeIn.value);
         }
       });
 
       const submitBtn = h("button", {
-        class: "btn primary sm",
+        class: "btn primary sm" + (busy ? " busy" : ""),
         type: "button",
+        disabled: busy,
         onclick: () => submitManualOAuthCode(codeIn.value),
-      }, "提交");
+      }, busy ? [h("span", { class: "spin" }), " 换取 token 中…"] : "提交");
 
-      const pasteBtn = h("button", {
-        class: "btn sm",
-        type: "button",
-        title: "直接读取剪贴板并提交",
-        onclick: async () => {
-          try {
-            if (navigator.clipboard?.readText) {
-              const txt = await navigator.clipboard.readText();
-              if (txt) {
-                codeIn.value = txt.trim();
-                submitManualOAuthCode(txt);
-                return;
-              }
-            }
-            toast("剪贴板为空或未授权读取，请在输入框直接按 Ctrl+V 粘贴", true);
-          } catch (err) {
-            toast(`无法读取剪贴板（${err.message}），请在输入框按 Ctrl+V 粘贴`, true);
-          }
-        },
-      }, "一键粘贴提交");
-
-      const inputRow = h("div", { class: "row gap-xs", style: "margin-bottom:6px" }, codeIn, submitBtn, pasteBtn);
+      const inputRow = h("div", { class: "row gap-xs", style: "margin-bottom:6px" }, codeIn, submitBtn);
       const status = h("div", { class: "acct-add-status" + (addFlow.phase ? ` ${addFlow.phase}` : "") });
-      addUi = { status, btn: submitBtn, statusText };
+      if (addFlow.text) {
+        status.appendChild(h("span", { text: addFlow.text }));
+      }
+      addUi = { status, btn: submitBtn, statusText: null };
 
       addCard.append(head, hint, actionRow, inputRow, status);
     } else {
@@ -3666,7 +3654,10 @@
 
   async function beginBrowserOAuthFlow() {
     stopAddPoll();
-    setAddProgress("busy", "正在获取授权链接…");
+    addFlow.active = true;
+    addFlow.phase = "busy";
+    addFlow.text = "正在获取授权链接…";
+    renderAccounts();
     toast("正在获取授权链接…");
 
     // Pre-open new tab synchronously on click to guarantee popup blockers do not block it
@@ -3678,11 +3669,14 @@
     try {
       const r = await api("/v1/accounts/oauth/start", {
         method: "POST",
-        body: { auto: true },
+        body: { open: false },
         timeoutMs: 15000,
       });
       addFlow.state = r.state || null;
       addFlow.authUrl = r.authUrl || null;
+      addFlow.active = true;
+      addFlow.phase = "";
+      addFlow.text = "";
 
       if (r.authUrl) {
         if (authWin && !authWin.closed) {
@@ -3693,29 +3687,19 @@
         }
       }
 
-      setAddProgress("busy", "已打开 Google 授权窗口，请在其中授权…");
-      toast("已打开授权窗口，请登录并授权");
+      toast("已打开授权窗口，请登录后复制授权码粘贴至下方");
       renderAccounts();
-      startOAuthStatusPoll();
       loadHealth();
     } catch (err) {
       if (authWin && !authWin.closed) {
         try { authWin.close(); } catch {}
       }
-      setAddProgress("err", `添加失败：${err.message}`);
-      toast(`添加失败：${err.message}`, true);
+      addFlow.active = true;
+      addFlow.phase = "err";
+      addFlow.text = `获取授权链接失败：${err.message}`;
+      toast(`获取授权链接失败：${err.message}`, true);
       renderAccounts();
     }
-  }
-
-  function oauthPhaseLabel(st, hint, err) {
-    if (st === "exchanging" || hint === "exchanging") return "正在保存账号…";
-    if (hint === "exchange_failed") return err ? `换票失败，重试中…` : "换票失败，重试中…";
-    if (hint === "need_callback_tab") return "请切到授权完成页（Authentication）";
-    if (hint === "capturing_url" || st === "capturing") return "正在读取授权结果…";
-    if (st === "pending" || st === "browser_opened") return "添加中…";
-    if (st === "waiting_auth") return "等待浏览器授权…";
-    return "添加中…";
   }
 
   function finishAddSuccess(emailOrName) {
@@ -3726,7 +3710,7 @@
     toast(label);
     setTimeout(() => {
       resetAddFlow();
-      renderAccounts();
+      renderAccounts(true);
       loadHealth();
       loadModels();
       loadUsage(true);
@@ -3743,72 +3727,15 @@
   function extractCodeFromClip(t) {
     if (!t) return null;
     const s = String(t).trim();
-    const m = s.match(/[?&#]code=([^&#\s]+)/);
-    if (m?.[1]) return decodeURIComponent(m[1]);
+    const m = s.match(/[?&#]code=([^&#\s]+)/i);
+    if (m?.[1]) {
+      try { return decodeURIComponent(m[1]).trim(); } catch { return m[1].trim(); }
+    }
+    const gm = s.match(/\b([41]\/[0-9A-Za-z\-_]{20,})\b/);
+    if (gm?.[1]) return gm[1].trim();
     const bare = s.replace(/\s+/g, "");
-    if (bare.length >= 30 && !/^https?:/i.test(bare) && /^[A-Za-z0-9_/\-.+=]+$/.test(bare)) return bare;
-    return null;
-  }
-
-  function startOAuthStatusPoll() {
-    stopAddPoll();
-    let n = 0;
-    let lastLabel = "";
-    const seenCodes = new Set();
-    let finishing = false;
-    addAccountPoll = setInterval(async () => {
-      n += 1;
-      if (n > 300) {
-        finishAddError("添加超时");
-        return;
-      }
-      if (!addFlow.state || finishing) return;
-      try {
-        // Silent clipboard assist — scan every tick (backend also watches)
-        try {
-          if (navigator.clipboard?.readText) {
-            const code = extractCodeFromClip(await navigator.clipboard.readText());
-            if (code && !seenCodes.has(code)) {
-              seenCodes.add(code);
-              setAddProgress("busy", "正在保存账号…");
-              finishing = true;
-              try {
-                const r = await api("/v1/accounts/oauth/finish", {
-                  method: "POST",
-                  body: { state: addFlow.state, code },
-                  timeoutMs: 30000,
-                });
-                finishAddSuccess(r.email || r.name);
-                return;
-              } catch {
-                finishing = false;
-                /* keep waiting for a fresh code */
-              }
-            }
-          }
-        } catch { /* no clipboard permission */ }
-
-        if (!addFlow.state) return;
-        const s = await api(`/v1/accounts/oauth/status?state=${encodeURIComponent(addFlow.state)}`, {
-          timeoutMs: 8000,
-        });
-        if (s.status === "done" && s.result) {
-          finishAddSuccess(s.result.email || s.result.name);
-          return;
-        }
-        if (s.status === "error" || s.status === "missing") {
-          finishAddError(s.error || "添加失败");
-          return;
-        }
-        const label = oauthPhaseLabel(s.status, s.hint, s.error);
-        if (label !== lastLabel) {
-          lastLabel = label;
-          setAddProgress("busy", label);
-        }
-      } catch {
-        /* ignore transient */
-      }
-    }, 1000);
+    if (bare.length >= 20 && !/^https?:/i.test(bare) && /^[A-Za-z0-9_/\-.+=]+$/.test(bare)) return bare;
+    return s;
   }
 
   async function switchAccount(name) {

@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { whoami, getActive, listProfiles } from "./accounts.js";
 import { readJson, writeJson, resolveAgyBinary, extractOauthClientFromBinary } from "./utils.js";
+import { proxyFetch } from "./httpProxy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -153,7 +154,7 @@ async function refreshAccessToken(refreshToken) {
     refresh_token: refreshToken,
     grant_type: "refresh_token",
   });
-  const res = await fetch(TOKEN_URL, {
+  const res = await proxyFetch(TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body,
@@ -233,7 +234,7 @@ async function resolveAccessToken(profileName = null) {
 }
 
 async function postCloudCode(url, accessToken, body) {
-  const res = await fetch(url, {
+  const res = await proxyFetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${accessToken}`,
