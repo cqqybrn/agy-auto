@@ -610,13 +610,17 @@
       }
       for (const t of c.turns || []) {
         if (!t || typeof t !== "object") continue;
-        if (t.status === "running") {
-          t.status = "aborted";
-          t.endedAt = t.endedAt || t.startedAt;
-          t.blocks = t.blocks || [];
-          t.blocks.push({ kind: "system", key: uid("s"), text: "页面刷新或关闭，本次运行已中断。" });
+        if (t.status === "running" && t.runId) {
+          t._reattach = true;
+        } else {
+          if (t.status === "running") {
+            t.status = "aborted";
+            t.endedAt = t.endedAt || t.startedAt;
+            t.blocks = t.blocks || [];
+            t.blocks.push({ kind: "system", key: uid("s"), text: "页面刷新或关闭，本次运行已中断。" });
+          }
+          for (const b of t.blocks || []) if (b && b.state === "running") b.state = "stopped";
         }
-        for (const b of t.blocks || []) if (b && b.state === "running") b.state = "stopped";
         if (Array.isArray(t.blocks)) {
           t.blocks = t.blocks.filter((b) => !(b.kind === "text" && isToolOutputText(b.text)));
         }
@@ -1283,20 +1287,112 @@
       : null;
     const head = h("div", { class: "a-head" });
     const blocks = h("div", { class: "a-blocks" });
+    const live = h("div", { class: "a-live hidden" });
     const foot = h("div", { class: "a-foot" });
     const root = h("article", { class: "turn" },
       h("div", { class: "u-msg" }, attachRow, h("div", { class: "u-bubble", text: cleanPrompt }), uMeta),
-      h("div", { class: "a-msg" }, head, blocks, foot),
+      h("div", { class: "a-msg" }, head, blocks, live, foot),
     );
     const prevTx = turn._v?.tx;
-    turn._v = { conv, root, head, blocks, foot, els: new Map(), tx: new Map(), wait: null };
+    turn._v = { conv, root, head, blocks, live, foot, els: new Map(), tx: new Map(), wait: null };
     if (prevTx) for (const [id, tx] of prevTx) { clearInterval(tx.timer); }
     paintHead(turn);
     paintAllBlocks(turn);
     paintWait(turn);
     updateCaret(turn);
+    paintLive(turn);
     paintFoot(turn);
     return root;
+  }
+
+  function selectingIn(el) {
+    const sel = window.getSelection?.();
+    if (!el || !sel || sel.isCollapsed || !sel.rangeCount) return false;
+    return el.contains(sel.anchorNode) || el.contains(sel.focusNode);
+  }
+
+  /** Rebuilding the turn would wipe the user's text selection; retry once it is released. */
+  function deferWhileSelecting(turn) {
+    if (!selectingIn(turn._v.blocks)) return false;
+    if (!turn._v.selWait) {
+      turn._v.selWait = setTimeout(() => {
+        turn._v.selWait = 0;
+        if (!attached(turn)) return;
+        paintAllBlocks(turn);
+        updateCaret(turn);
+      }, 700);
+    }
+    return true;
+  }
+
+  function clearSelection() {
+    window.getSelection?.()?.removeAllRanges();
+  }
+
+  function toolLabel(b) {
+    const d = describeTool(b.name, b.params);
+    return d.phrase || [d.verb, d.target].filter(Boolean).join(" ") || b.name || "工具";
+  }
+
+  function errorSnippet(b) {
+    const raw = b.error != null ? pretty(b.error) : typeof b.output === "string" ? b.output : b.output != null ? pretty(b.output) : "";
+    const lines = raw.split(/\r?\n|(?<=\.)\s+(?=[A-Z])/).map((l) => l.trim()).filter(Boolean);
+    const hit = [...lines].reverse().find((l) => /error|exception|traceback|failed|fatal|denied|not found|no such|无法|错误|失败/i.test(l) && !/^Created At:/.test(l));
+    const line = hit || lines[lines.length - 1] || "";
+    return [b.exitCode ? `退出码 ${b.exitCode}` : "", line].filter(Boolean).join(" · ");
+  }
+
+  const CONTINUE_AFTER_KILL_PROMPT = "上一轮有后台任务在 agy 退出时被强制终止（agy 最多只等后台任务 30 分钟）。请先检查这些任务的实际状态（日志、进程、产物）并直接告诉我结果；没完成的，改用独立进程重新启动（Windows 用 Start-Process；WSL 用隐藏的 wsl.exe 前台运行并把输出写入日志文件），然后继续原来的任务。";
+
+  /** Status strip under a turn: latest transcript activity, background tasks, idle-wait countdown. */
+  function paintLive(turn) {
+    const v = turn._v;
+    if (!v?.live) return;
+    const now = Date.now();
+    const rows = [];
+    const row = (cls, ico, k, val, extra) => h("div", { class: `lv-row ${cls}` },
+      icon(ico), h("span", { class: "lv-k", text: k }), h("span", { class: "lv-v", text: val }), extra || null);
+    if (turn.status === "running") {
+      const act = turn._txLast;
+      if (act) rows.push(row("", "zap", "最新动态", `第 ${act.idx} 步 · ${act.desc}`,
+        act.at ? h("span", { class: "lv-t", text: `${fmtDur(now - act.at)}前` }) : null));
+      const th = turn.thoughts?.[turn.thoughts.length - 1];
+      if (th?.thinking) {
+        const at = Date.parse(th.created_at || "");
+        rows.push(row("", "brain", "最新思路", oneLine(th.thinking, 220),
+          at ? h("span", { class: "lv-t", text: `${fmtDur(now - at)}前` }) : null));
+      }
+      for (const b of turn.blocks || []) {
+        if (b.bg && !b.bg.finished && b.state === "running") {
+          const since = Date.parse(b.bg.since || "");
+          rows.push(row("", "terminal", "后台任务", oneLine(b.bg.desc || toolLabel(b), 140),
+            since ? h("span", { class: "lv-t", text: `已运行 ${fmtDur(now - since)}` }) : null));
+        }
+        if (b.kind === "subagent") {
+          for (const sa of b.subagents || []) {
+            if (sa.finished) continue;
+            const last = sa._last;
+            rows.push(row("", "bot", "子代理", `${sa.role || sa.type_name || "subagent"} 运行中${last ? ` · ${last.desc}` : ""}`,
+              last?.at ? h("span", { class: "lv-t", text: `${fmtDur(now - last.at)}前` }) : null));
+          }
+        }
+      }
+      if (turn.idleWait) {
+        const left = Math.max(0, turn.idleWait.limitMs - (now - turn.idleWait.at));
+        const pending = (turn.blocks || []).filter((b) => b.bg && !b.bg.finished && b.state === "running")
+          .map((b) => oneLine(b.bg.desc || toolLabel(b), 60));
+        const conv = state.convs.find((c) => (c.turns || []).includes(turn));
+        rows.push(row("warn", "clock", "等待后台任务",
+          `agent 已写完回复，只剩 ${turn.idleWait.count} 个后台任务没结束${pending.length ? `（${pending.join("；")}）` : ""}。agy 最多再等 ${fmtDur(left)}；不需要这些任务就直接结束。`,
+          conv ? h("button", { class: "btn sm", onclick: () => stopRun(conv.id) }, icon("stop"), "结束等待") : null));
+      }
+    }
+    if (turn.bgKilled) {
+      rows.push(row("err", "alert", "后台任务被终止", `${turn.bgKilled} 个后台任务在 agy 退出时被强制终止（agy 最多只等后台任务 30 分钟）。`,
+        turn.status !== "running" ? h("button", { class: "btn sm", onclick: () => setPrompt(CONTINUE_AFTER_KILL_PROMPT) }, icon("rotate"), "让 agent 检查并继续") : null));
+    }
+    v.live.replaceChildren(...rows);
+    v.live.classList.toggle("hidden", !rows.length);
   }
 
   const attached = (turn) => !!turn._v && turn._v.root.isConnected;
@@ -1357,6 +1453,10 @@
 
   function isStepBlock(b) {
     return b?.kind === "tool" || b?.kind === "subagent";
+  }
+
+  function isSubagentBlock(b) {
+    return b?.kind === "subagent" || (b?.kind === "tool" && b.name === "invoke_subagent");
   }
 
   function classifyTool(toolName, params) {
@@ -1506,6 +1606,7 @@
   /** Rebuild block list: tool/subagent rows live in a collapsible group that auto-closes when the turn finishes. */
   function paintAllBlocks(turn) {
     if (!turn._v) return;
+    if (deferWhileSelecting(turn)) return;
     const v = turn._v;
     const frag = document.createDocumentFragment();
     const els = new Map();
@@ -1558,6 +1659,7 @@
           type: "button",
           title: open ? "收起" : "展开",
           onclick: () => {
+            clearSelection();
             turn[key] = !turn[key];
             paintAllBlocks(turn);
           },
@@ -1565,6 +1667,26 @@
         body,
       );
       frag.appendChild(wrap);
+
+      const failed = noise ? [] : bucket.filter((b) => b.state === "error");
+      if (failed.length) {
+        frag.appendChild(h("div", { class: "step-fails" },
+          failed.length > 3 ? h("div", { class: "sf-more", text: `共 ${failed.length} 个步骤失败，显示最近 3 个` }) : null,
+          ...failed.slice(-3).map((b) => h("button", {
+            class: "step-fail",
+            type: "button",
+            title: "点击展开这一步的详细输出",
+            onclick: () => {
+              clearSelection();
+              turn[key] = true;
+              b._open = true;
+              paintAllBlocks(turn);
+            },
+          },
+          icon("alert"),
+          h("span", { class: "sf-label", text: `失败：${oneLine(toolLabel(b), 80)}` }),
+          h("span", { class: "sf-err", text: oneLine(errorSnippet(b), 200) })))));
+      }
     };
 
     const flushSteps = () => {
@@ -1575,7 +1697,8 @@
     };
 
     for (const b of turn.blocks || []) {
-      if (isStepBlock(b)) {
+      // subagent cards stay outside the collapsible group so their progress is always visible
+      if (isStepBlock(b) && !isSubagentBlock(b)) {
         if (isNoiseTool(b)) noiseBucket.push(b);
         else mainBucket.push(b);
       } else {
@@ -1600,6 +1723,7 @@
       paintAllBlocks(turn);
       return;
     }
+    if (deferWhileSelecting(turn)) return;
     const v = turn._v;
     const el = buildBlock(turn, b);
     const old = v.els.get(b.key);
@@ -1632,7 +1756,7 @@
       } else {
         for (const b of p.blocks) paintBlock(turn, b);
       }
-      if (p.meta) { paintHead(turn); paintFoot(turn); }
+      if (p.meta) { paintHead(turn); paintLive(turn); paintFoot(turn); }
       paintWait(turn);
       updateCaret(turn);
     }
@@ -1645,8 +1769,24 @@
     const p = parseMaybeJSON(b?.params);
     const obj = p && typeof p === "object" ? p : {};
     let raw = obj.Subagents ?? obj.subagents ?? obj.agents;
+    const rawText = typeof raw === "string" ? raw : null;
     if (typeof raw === "string") raw = parseMaybeJSON(raw);
-    if (!Array.isArray(raw) || !raw.length) return [];
+    if (!Array.isArray(raw) || !raw.length) {
+      // transcript args get cut ("<truncated N bytes>"), which breaks the JSON: salvage prompts/roles/ids
+      const outText = b?.output == null ? "" : typeof b.output === "string" ? b.output : JSON.stringify(b.output);
+      const ids = [...outText.matchAll(/"conversationId":\s*"([0-9a-f-]{36})"/gi)].map((m) => m[1]);
+      const grab = (key) => rawText ? [...rawText.matchAll(new RegExp(`"${key}"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)`, "g"))]
+        .map((m) => m[1].replace(/\n?<truncated \d+ bytes>$/, "").replace(/\\n/g, "\n").replace(/\\(.)/g, "$1")) : [];
+      const roles = grab("Role");
+      const prompts = grab("Prompt");
+      const n = Math.max(ids.length, roles.length, prompts.length);
+      return Array.from({ length: n }, (_, i) => ({
+        role: roles[i] || "subagent",
+        initial_prompt: prompts[i] || null,
+        conversation_id: ids[i] || null,
+        transcript_id: ids[i] || null,
+      }));
+    }
     const subs = raw.map((sa) => ({
       role: sa.Role || sa.role || sa.TypeName || sa.type_name || "subagent",
       type_name: sa.TypeName || sa.type_name || sa.Type || sa.type,
@@ -1809,7 +1949,7 @@
   function buildTool(turn, b) {
     const d = describeTool(b.name, b.params);
     if (d.kind === "task") return buildTask(b);
-    const toggle = () => { b._open = !b._open; paintBlock(turn, b); };
+    const toggle = () => { clearSelection(); b._open = !b._open; paintBlock(turn, b); };
     const label = d.phrase || [d.verb, d.target].filter(Boolean).join(" ");
     const el = h("div", { class: "blk-tool" + (b._open ? " open" : "") },
       h("button", { class: "bt-row", title: d.title || label || b.name || "", onclick: toggle },
@@ -1871,53 +2011,80 @@
     if (!subs.length) el.appendChild(h("div", { class: "bs-item" }, h("div", { class: "bs-prompt", text: "等待子代理信息…" })));
     for (const sa of subs) {
       const id = sa.transcript_id || sa.conversation_id;
-      const tx = id ? turn._v?.tx?.get(id) : null;
+      let tx = null;
+      if (id && turn._v?.tx) {
+        tx = turn._v.tx.get(id);
+        if (!tx) {
+          tx = { open: false, el: h("div", { class: "bs-tx hidden" }), timer: null, openKeys: new Set() };
+          turn._v.tx.set(id, tx);
+          if (turn.status === "running" && !sa.finished) setTranscriptOpen(turn, id, tx, true);
+        }
+      }
       const promptText = sa.initial_prompt || sa.prompt || sa.task || sa.Prompt || null;
       const promptEl = promptText ? h("div", { class: "bs-prompt", title: "点击展开完整提示词", text: promptText }) : null;
       if (promptEl) promptEl.onclick = () => promptEl.classList.toggle("full");
       const txBtn = id ? h("button", { class: "btn sm", onclick: () => toggleTranscript(turn, id, txBtn) },
         icon("bulb"), tx?.open ? "收起思考与步骤" : "查看思考与步骤") : null;
+      const running = turn.status === "running" && !sa.finished;
+      const last = sa._last;
+      const liveLine = running
+        ? h("div", { class: "bs-live" }, h("span", { class: "spin" }),
+          h("span", { text: last ? `第 ${last.total || last.idx + 1} 步 · ${last.desc}` : "子代理运行中…" }),
+          last?.at ? h("span", { class: "dim", text: `${fmtDur(Date.now() - last.at)}前` }) : null)
+        : sa.finished
+          ? h("div", { class: "bs-live done" }, icon("check"), h("span", { text: sa.report ? `已汇报：${sa.report}` : "已汇报" }))
+          : null;
       const item = h("div", { class: "bs-item" },
         h("div", { class: "bs-role" }, sa.role || sa.type_name || "subagent",
           sa.type_name && sa.type_name !== sa.role ? h("span", { class: "tag", text: sa.type_name }) : null,
           sa.model ? h("span", { class: "tag dim", text: sa.model }) : null),
         promptEl,
+        liveLine,
         h("div", { class: "bs-actions" },
           txBtn,
           id ? h("button", { class: "btn sm ghost", title: "全屏查看 transcript", onclick: () => openTranscriptModal(id, sa.role) }, icon("external"), "全屏") : null,
           id ? h("span", { class: "tag mono", style: "cursor:pointer", title: `${id}（点击复制）`, onclick: () => copyText(id, "已复制子代理 conversation_id") }, `#${shortId(id)}`) : null,
         ),
       );
-      if (id && turn._v?.tx) {
-        const txState = turn._v.tx.get(id) || { open: false, el: h("div", { class: "bs-tx hidden" }), timer: null, openKeys: new Set() };
-        turn._v.tx.set(id, txState);
-        item.appendChild(txState.el);
-      }
+      if (tx) item.appendChild(tx.el);
       el.appendChild(item);
     }
     return el;
   }
 
-  function toggleTranscript(turn, id, btn) {
-    const tx = turn._v.tx.get(id);
-    if (!tx) return;
-    tx.open = !tx.open;
-    tx.el.classList.toggle("hidden", !tx.open);
-    btn.lastChild.textContent = tx.open ? "收起思考与步骤" : "查看思考与步骤";
+  function setTranscriptOpen(turn, id, tx, open) {
+    tx.open = open;
+    tx.el.classList.toggle("hidden", !open);
+    tx.el.classList.toggle("live", open && turn.status === "running");
     clearInterval(tx.timer);
     tx.timer = null;
-    if (tx.open) {
+    if (open) {
       loadTranscriptInto(id, tx);
       if (turn.status === "running") tx.timer = setInterval(() => loadTranscriptInto(id, tx), 4000);
     }
+  }
+
+  function toggleTranscript(turn, id, btn) {
+    const tx = turn._v.tx.get(id);
+    if (!tx) return;
+    setTranscriptOpen(turn, id, tx, !tx.open);
+    btn.lastChild.textContent = tx.open ? "收起思考与步骤" : "查看思考与步骤";
   }
 
   async function loadTranscriptInto(id, tx) {
     if (!tx.el.childElementCount) tx.el.appendChild(h("div", { class: "loading-line" }, h("span", { class: "spin" }), "读取 transcript…"));
     for (const d of $$("details[data-k]", tx.el)) (d.open ? tx.openKeys.add(d.dataset.k) : tx.openKeys.delete(d.dataset.k));
     try {
-      const data = await api(`/v1/transcripts/${encodeURIComponent(id)}?limit=500`, { timeoutMs: 20000 });
+      const data = await api(`/v1/transcripts/${encodeURIComponent(id)}?limit=500&tail=1`, { timeoutMs: 20000 });
+      const steps = data.steps || [];
+      const last = steps[steps.length - 1];
+      const sig = `${data.total}:${last?.step_index}:${(last?.content || "").length}:${(last?.thinking || "").length}`;
+      if (sig === tx.sig && tx.el.querySelector(".tx")) return;
+      if (selectingIn(tx.el)) return;
+      tx.sig = sig;
+      const stick = tx.el.scrollHeight - tx.el.scrollTop - tx.el.clientHeight < 60;
       tx.el.replaceChildren(renderTranscript(data, tx.openKeys));
+      if (stick) tx.el.scrollTop = tx.el.scrollHeight;
     } catch (err) {
       const msg = err.status === 404 ? "Transcript 尚未生成（子代理可能刚启动），稍后自动重试。" : `读取失败：${err.message}`;
       tx.el.replaceChildren(h("div", { class: "tx-empty", text: msg }));
@@ -2053,6 +2220,7 @@
       const turn = conv.turns[conv.turns.length - 1];
       const el = turn?._v?.head.querySelector(".el");
       if (el) el.textContent = fmtDur(Date.now() - turn.startedAt);
+      if (turn && attached(turn)) paintLive(turn);
     }
   }, 1000);
 
@@ -2185,6 +2353,65 @@
     if (turn.status === "running") finishTurn(conv, turn, live.stopping ? "aborted" : "error", live.stopping ? undefined : { message: "连接意外中断（未收到 done 事件）" });
   }
 
+  /** Re-attach to the server-side run after the SSE connection drops (the run keeps going on the server). */
+  async function followUntilDone(conv, turn, live) {
+    for (let attempt = 0; turn.status === "running" && !live.stopping && attempt < 5; attempt++) {
+      if (attempt) await new Promise((r) => setTimeout(r, 1500 * attempt));
+      try {
+        const gone = await resumeStream(conv, turn, live);
+        if (gone) break;
+      } catch (err) {
+        if (err.name === "AbortError" || live.stopping) break;
+      }
+    }
+    if (turn.status === "running") {
+      finishTurn(conv, turn, live.stopping ? "aborted" : "error", live.stopping ? undefined : { message: "与服务端的连接已断开，且服务端已没有这次运行的记录（可能服务重启过）。已从对话记录恢复可见内容。" });
+    }
+  }
+
+  /** Returns true when the server no longer knows this run. */
+  async function resumeStream(conv, turn, live) {
+    live.ctrl = new AbortController();
+    const res = await fetch(apiUrl(`/v1/agent/stream/${encodeURIComponent(turn.runId)}?after=${turn.lastSeq || 0}`), {
+      headers: headers(false),
+      signal: live.ctrl.signal,
+    });
+    if (res.status === 404) return true;
+    if (!res.ok || !res.body) throw apiError(res, await res.json().catch(() => ({})));
+    await readSse(res, (ev, obj) => onStreamEvent(conv, turn, live, ev, obj));
+    return false;
+  }
+
+  /** Page was refreshed while runs were in flight: rebuild those turns from the server's event buffer. */
+  async function reattachRuns() {
+    for (const conv of state.convs) {
+      const turn = (conv.turns || [])[conv.turns.length - 1];
+      for (const t of conv.turns || []) {
+        if (t._reattach && t !== turn) {
+          t._reattach = false;
+          t.status = "aborted";
+          for (const b of t.blocks || []) if (b.state === "running") b.state = "stopped";
+        }
+      }
+      if (!turn?._reattach) continue;
+      turn._reattach = false;
+      turn.blocks = [];
+      turn.thoughts = null;
+      turn.thinking = "";
+      turn.stderr = "";
+      turn.lastSeq = 0;
+      turn.idleWait = null;
+      turn.bgKilled = 0;
+      const live = { runId: turn.runId, ctrl: new AbortController(), mode: "stream", stopping: false };
+      state.live.set(conv.id, live);
+      renderConvList();
+      if (conv.id === state.activeId) renderThread();
+      syncComposer();
+      const enrichTimer = setInterval(() => liveTick(conv, turn), 3000);
+      followUntilDone(conv, turn, live).finally(() => clearInterval(enrichTimer));
+    }
+  }
+
   function renderQueue(conv) {
     if (!conv || conv.id !== state.activeId) return;
     $$(".q-msg", threadInner).forEach((el) => el.remove());
@@ -2218,51 +2445,59 @@
   }
 
   async function runStream(conv, turn, payload, live) {
-    const enrichTimer = setInterval(() => {
-      if (conv.conversationId) enrichTurnFromTranscript(conv, turn);
-    }, 3000);
+    const enrichTimer = setInterval(() => liveTick(conv, turn), 3000);
     try {
-      const res = await fetch(apiUrl("/v1/agent/stream"), {
-        method: "POST",
-        headers: headers(true),
-        body: JSON.stringify(payload),
-        signal: live.ctrl.signal,
-      });
-      if (!res.ok || !res.body) {
-        const data = await res.json().catch(() => ({}));
-        throw apiError(res, data);
-      }
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = "";
-      for (;;) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        let m;
-        while ((m = buf.match(/\r?\n\r?\n/))) {
-          const block = buf.slice(0, m.index);
-          buf = buf.slice(m.index + m[0].length);
-          let ev = "message";
-          const data = [];
-          for (const line of block.split(/\r?\n/)) {
-            if (line.startsWith("event:")) ev = line.slice(6).trim();
-            else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
-          }
-          if (!data.length) continue;
-          let obj;
-          try { obj = JSON.parse(data.join("\n")); } catch { continue; }
-          onStreamEvent(conv, turn, live, ev, obj);
+      try {
+        const res = await fetch(apiUrl("/v1/agent/stream"), {
+          method: "POST",
+          headers: headers(true),
+          body: JSON.stringify(payload),
+          signal: live.ctrl.signal,
+        });
+        if (!res.ok || !res.body) {
+          const data = await res.json().catch(() => ({}));
+          throw apiError(res, data);
         }
+        await readSse(res, (ev, obj) => onStreamEvent(conv, turn, live, ev, obj));
+      } catch (err) {
+        if (err.name === "AbortError" || live.stopping || !turn.lastSeq) throw err;
       }
+      await followUntilDone(conv, turn, live);
     } finally {
       clearInterval(enrichTimer);
+    }
+  }
+
+  async function readSse(res, onEvent) {
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let m;
+      while ((m = buf.match(/\r?\n\r?\n/))) {
+        const block = buf.slice(0, m.index);
+        buf = buf.slice(m.index + m[0].length);
+        let ev = "message";
+        const data = [];
+        for (const line of block.split(/\r?\n/)) {
+          if (line.startsWith("event:")) ev = line.slice(6).trim();
+          else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+        }
+        if (!data.length) continue;
+        let obj;
+        try { obj = JSON.parse(data.join("\n")); } catch { continue; }
+        onEvent(ev, obj);
+      }
     }
   }
 
   function onStreamEvent(conv, turn, live, ev, d) {
     const type = ev !== "message" ? ev : d.type;
     const si = d.step_index;
+    if (d.seq) turn.lastSeq = Math.max(turn.lastSeq || 0, d.seq);
     switch (type) {
       case "run_started":
         if (d.run_id) live.runId = turn.runId = d.run_id;
@@ -2280,7 +2515,7 @@
         if (!turn.thoughts) turn.thoughts = [];
         let cur = turn.thoughts[turn.thoughts.length - 1];
         if (!cur || (si != null && cur.step_index !== si)) {
-          cur = { step_index: si, thinking: "" };
+          cur = { step_index: si, thinking: "", created_at: new Date(d.ts || Date.now()).toISOString() };
           turn.thoughts.push(cur);
         }
         cur.thinking += text;
@@ -2292,7 +2527,7 @@
         if (d.thinking) {
           if (!turn.thoughts) turn.thoughts = [];
           if (!turn.thoughts.some((th) => th.thinking === d.thinking)) {
-            turn.thoughts.push({ step_index: si, thinking: d.thinking });
+            turn.thoughts.push({ step_index: si, thinking: d.thinking, created_at: new Date(d.ts || Date.now()).toISOString() });
             turn.thinking = turn.thoughts.map((x) => x.thinking).join("\n\n---\n\n");
             schedulePaint(turn, null, true);
           }
@@ -2301,7 +2536,7 @@
         if (text && typeof text === "string" && text.trim() && !isToolOutputText(text)) {
           const key = si != null ? `t${si}` : uid("t");
           upsertBlock(turn, key, "text", (b) => {
-            b.text = text;
+            if (!b._tx || text.length >= (b.text || "").length) b.text = text;
           });
         }
         break;
@@ -2311,6 +2546,8 @@
         if (!text || isToolOutputText(text)) break;
         const last = turn.blocks[turn.blocks.length - 1];
         const key = si != null ? `t${si}` : last?.kind === "text" ? last.key : uid("t");
+        // Already filled in (complete) from the transcript while the stream was blocked
+        if (turn.blocks.find((x) => x.key === key)?._tx) break;
         upsertBlock(turn, key, "text", (b) => {
           b.text = b.text || "";
           if (b.text && text.length > b.text.length && text.startsWith(b.text)) b.text = text;
@@ -2324,7 +2561,7 @@
         if (d.thinking) {
           if (!turn.thoughts) turn.thoughts = [];
           if (!turn.thoughts.some((th) => th.thinking === d.thinking)) {
-            turn.thoughts.push({ step_index: si, thinking: d.thinking });
+            turn.thoughts.push({ step_index: si, thinking: d.thinking, created_at: new Date(d.ts || Date.now()).toISOString() });
             turn.thinking = turn.thoughts.map((x) => x.thinking).join("\n\n---\n\n");
           }
         }
@@ -2334,7 +2571,9 @@
           if (params != null) b.params = params;
           if (info.output != null) b.output = info.output;
           if (info.error != null) b.error = info.error;
-          b.state = info.error ? "error" : normState(d.state, b.state || "running");
+          const next = info.error ? "error" : normState(d.state, b.state || "running");
+          // the transcript may already know this step finished (the stream lags behind background steps)
+          if (!(next === "running" && (b.state === "done" || b.state === "error")) && !(b.exitCode && next === "done")) b.state = next;
         });
         break;
       }
@@ -2352,10 +2591,18 @@
       case "system":
         if (d.text_delta) upsertBlock(turn, si != null ? `y${si}` : uid("y"), "system", (b) => { b.text = d.text_delta; });
         break;
-      case "stderr":
-        turn.stderr = (turn.stderr + (d.text || "")).slice(-40000);
+      case "stderr": {
+        const text = d.text || "";
+        turn.stderr = (turn.stderr + text).slice(-40000);
+        const idle = text.match(/root agent idle; waiting up to (\S+) for (\d+) background task/);
+        if (idle && !turn.idleWait) turn.idleWait = { at: d.ts || Date.now(), limitMs: parseGoDuration(idle[1]), count: +idle[2] };
+        const killed = text.match(/terminating (\d+) background task\(s\) on exit/);
+        if (killed) turn.bgKilled = +killed[1];
+        else if (/drain grace period expired/.test(text) && !turn.bgKilled) turn.bgKilled = turn.idleWait?.count || 1;
         schedulePaint(turn, null, true);
+        paintLive(turn);
         break;
+      }
       case "result":
         if (d.conversation_id) setConversationId(conv, d.conversation_id);
         if (d.response != null) turn.response = d.response;
@@ -2408,13 +2655,307 @@
     if (conv.id === state.activeId) renderTopbar();
   }
 
+  // ---------- transcript ⇄ live stream merge ----------
+  // agy streams steps strictly in order, so one backgrounded command holds back every later
+  // step; the transcript is written as steps finish and is used to fill the gap.
+  const TOOL_EXIT_RE = /exited with code (-?\d+)/;
+  const UUID_SENDER_RE = /sender=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s[\s\S]*?content=([\s\S]{0,400})/i;
+
+  function parseGoDuration(s) {
+    const m = String(s || "").match(/^(?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?$/);
+    if (!m) return 30 * 60000;
+    return ((+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0)) * 1000;
+  }
+
+  function scanTranscriptSignals(steps) {
+    const bgDone = new Map();
+    const subMsg = new Map();
+    for (const s of steps || []) {
+      if (!/system_message/i.test(s.type || "") || typeof s.content !== "string") continue;
+      const done = s.content.match(/Task id "([^"]+)" finished with result:\s*([\s\S]{0,400})/);
+      if (done) { bgDone.set(done[1], done[2]); continue; }
+      const sub = s.content.match(UUID_SENDER_RE);
+      if (sub) subMsg.set(sub[1].toLowerCase(), { at: s.created_at, text: sub[2] });
+    }
+    return { bgDone, subMsg };
+  }
+
+  function transcriptToolResult(out) {
+    const s = typeof out === "string" ? out : "";
+    if (/Tool is running as a background task/.test(s.slice(0, 300))) {
+      const m = s.match(/task id:\s*(\S+)\s+Task Description:\s*([\s\S]*?)\s+(?:Task logs are available|YOU MUST)/i);
+      return { bg: { id: m?.[1] || null, desc: (m?.[2] || "").trim() } };
+    }
+    const m = s.match(TOOL_EXIT_RE);
+    return { exitCode: m ? +m[1] : null };
+  }
+
+  function blockStepIndex(b) {
+    const m = /^[txsey](\d+)$/.exec(b?.key || "");
+    return m ? +m[1] : null;
+  }
+
+  function sortBlocksByStep(t) {
+    const idx = t.blocks.map(blockStepIndex);
+    let lastNumbered = -1;
+    idx.forEach((n, i) => { if (n != null) lastNumbered = i; });
+    let carry = -1;
+    const rows = t.blocks.map((b, i) => {
+      const n = idx[i];
+      if (n != null) carry = n;
+      return { b, i, o: n != null ? n : i > lastNumbered ? Infinity : carry + 0.5 };
+    });
+    rows.sort((a, z) => (a.o - z.o) || (a.i - z.i));
+    t.blocks = rows.map((r) => r.b);
+  }
+
+  /** Merge one turn's transcript steps into its blocks. Keys match the live stream (tool/subagent = output step index). */
+  function mergeTranscriptSteps(t, part, sig) {
+    if (!t.blocks) t.blocks = [];
+    let changed = false;
+    const before = t.blocks.length;
+    const running = t.status === "running";
+    const lo = part.length ? part[0].step_index : null;
+    const hi = part.length ? (running ? Infinity : part[part.length - 1].step_index + 1) : null;
+    t.blocks = t.blocks.filter((b) => {
+      if (/^tx-/.test(b.key || "") || (b.kind === "text" && isToolOutputText(b.text))) return false;
+      const n = blockStepIndex(b);
+      return n == null || lo == null || (n >= lo && n <= hi);
+    });
+    if (t.blocks.length !== before) changed = true;
+    const byIdx = new Map(part.map((s) => [s.step_index, s]));
+    const find = (key) => t.blocks.find((b) => b.key === key);
+    const set = (b, k, v) => { if (b[k] !== v) { b[k] = v; changed = true; } };
+
+    for (const s of part) {
+      if (s.tool_calls) {
+        const calls = Array.isArray(s.tool_calls) ? s.tool_calls : [s.tool_calls];
+        calls.forEach((tc, j) => {
+          const outIdx = s.step_index + 1 + j;
+          const outStep = byIdx.get(outIdx);
+          const output = outStep && !/planner_response|user_input/i.test(outStep.type || "") ? outStep.content : null;
+          const name = tc.name || tc.tool_name || tc.function?.name || "tool";
+          const isSub = name === "invoke_subagent";
+          const key = (isSub ? "s" : "x") + outIdx;
+          let b = find(key);
+          if (!b) {
+            b = { kind: isSub ? "subagent" : "tool", key, state: "running" };
+            t.blocks.push(b);
+            changed = true;
+          }
+          if (!b.name) set(b, "name", name);
+          const params = tc.args ?? tc.arguments ?? tc.parameters ?? tc.input;
+          if (b.params == null && params != null) set(b, "params", params);
+          if (output != null && b.output == null) set(b, "output", output);
+
+          let state = b.state || "running";
+          if (output != null) {
+            const r = transcriptToolResult(output);
+            if (r.bg) {
+              const res = r.bg.id ? sig.bgDone.get(r.bg.id) : undefined;
+              const finished = res != null;
+              const code = finished ? +(res.match(TOOL_EXIT_RE)?.[1] ?? 0) : 0;
+              const bg = { id: r.bg.id, desc: r.bg.desc, since: outStep.created_at || null, finished };
+              if (JSON.stringify(b.bg) !== JSON.stringify(bg)) { b.bg = bg; changed = true; }
+              if (finished && code) {
+                set(b, "exitCode", code);
+                if (b.error == null) set(b, "error", res);
+                state = "error";
+              } else state = finished ? "done" : running ? "running" : "stopped";
+            } else if (r.exitCode) {
+              set(b, "exitCode", r.exitCode);
+              state = "error";
+            } else if (state === "running") state = "done";
+          } else if (!running && state === "running") state = "done";
+
+          if (isSub) {
+            const subs = extractSubagentsFromToolBlock({ name, params: b.params, output: b.output });
+            if (!b.subagents?.length) {
+              if (subs.length) { b.subagents = subs; changed = true; }
+            } else {
+              b.subagents.forEach((sa, k) => {
+                if (!sa.conversation_id && subs[k]?.conversation_id) {
+                  sa.conversation_id = sa.transcript_id = subs[k].conversation_id;
+                  changed = true;
+                }
+              });
+            }
+            let anyRunning = false;
+            for (const sa of b.subagents || []) {
+              const id = String(sa.transcript_id || sa.conversation_id || "").toLowerCase();
+              const msg = id && sig.subMsg.get(id);
+              if (msg && !sa.finished) {
+                sa.finished = true;
+                sa.report = oneLine(msg.text, 300);
+                changed = true;
+              }
+              if (!sa.finished) anyRunning = true;
+            }
+            state = running && anyRunning ? "running" : state === "error" ? "error" : "done";
+          }
+          set(b, "state", state);
+        });
+      }
+
+      if (/planner_response|agent_response|model_response/i.test(s.type || "") &&
+          typeof s.content === "string" && s.content.trim() && !isToolOutputText(s.content)) {
+        const key = `t${s.step_index}`;
+        const b = find(key);
+        if (!b) {
+          t.blocks.push({ kind: "text", key, text: s.content, _tx: true });
+          changed = true;
+        } else if (b.text !== s.content && s.content.length >= (b.text || "").length) {
+          b.text = s.content;
+          b._tx = true;
+          changed = true;
+        } else if (!b._tx && (b.text || "").trim() === s.content.trim()) {
+          b._tx = true;
+        }
+      }
+    }
+
+    const numbered = t.blocks.filter((b) => b.kind === "text" && /^t\d+$/.test(b.key));
+    if (numbered.length) {
+      const all = numbered.map((b) => (b.text || "").trim()).join("\n");
+      const n = t.blocks.length;
+      t.blocks = t.blocks.filter((b) => !(b.kind === "text" && (b.key === "final" || b.key === "final-tx") && all.includes((b.text || "").trim())));
+      if (t.blocks.length !== n) changed = true;
+    }
+    if (changed) sortBlocksByStep(t);
+    return changed;
+  }
+
+  function describeTranscriptStep(s) {
+    const type = String(s?.type || "");
+    const calls = Array.isArray(s?.tool_calls) ? s.tool_calls : s?.tool_calls ? [s.tool_calls] : [];
+    if (calls.length) {
+      const tc = calls[0];
+      const name = tc.name || tc.tool_name || tc.function?.name || "tool";
+      const d = describeTool(name, tc.args ?? tc.arguments ?? tc.parameters ?? tc.input);
+      return `调用工具：${d.phrase || [d.verb, d.target].filter(Boolean).join(" ") || name}`;
+    }
+    const c = typeof s?.content === "string" ? s.content : "";
+    if (/user_input/i.test(type)) return "收到指令";
+    if (/system_message/i.test(type)) {
+      if (/Task id "[^"]+" finished/.test(c)) return "后台任务结束，agent 正在处理结果";
+      if (UUID_SENDER_RE.test(c)) return "收到子代理汇报";
+      return "系统通知";
+    }
+    if (/planner_response|agent_response|model_response/i.test(type)) return c.trim() ? `回复：${oneLine(c, 80)}` : "思考中";
+    const r = transcriptToolResult(c);
+    if (r.bg) return `命令已转入后台：${oneLine(r.bg.desc, 80)}`;
+    if (r.exitCode) return `命令失败（退出码 ${r.exitCode}）`;
+    return "工具执行完成";
+  }
+
+  const subPollBusy = new Set();
+  function pollSubagents(turn) {
+    if (turn.status !== "running") return;
+    for (const b of turn.blocks || []) {
+      if (b.kind !== "subagent") continue;
+      for (const sa of b.subagents || []) {
+        const id = sa.transcript_id || sa.conversation_id;
+        if (!id || sa.finished || subPollBusy.has(id)) continue;
+        subPollBusy.add(id);
+        api(`/v1/transcripts/${encodeURIComponent(id)}?limit=4&tail=1&thinking=0`, { timeoutMs: 8000 })
+          .then((data) => {
+            const steps = data?.steps || [];
+            const last = steps[steps.length - 1];
+            if (!last) return;
+            const pick = [...steps].reverse().find((s) => s.tool_calls || (/planner_response/i.test(s.type || "") && s.content)) || last;
+            const info = { idx: last.step_index, total: data.total || null, at: Date.parse(last.created_at) || null, desc: describeTranscriptStep(pick) };
+            if (JSON.stringify(sa._last) === JSON.stringify(info)) return;
+            sa._last = info;
+            if (attached(turn)) { paintAllBlocks(turn); paintLive(turn); }
+          })
+          .catch(() => {})
+          .finally(() => subPollBusy.delete(id));
+      }
+    }
+  }
+
+  function liveTick(conv, turn) {
+    if (conv.conversationId) enrichTurnFromTranscript(conv, turn);
+    pollSubagents(turn);
+  }
+
+  function partitionUserStep(part) {
+    return (part || []).find((s) => /^user_input$/i.test(String(s.type || ""))) || null;
+  }
+
+  const normPrompt = (s) => cleanUserPrompt(String(s || "")).replace(/[\s\\"'`]+/g, "").slice(0, 40);
+
+  /**
+   * Map turns to transcript partitions (one per USER_INPUT). Turns may be missing locally
+   * (sent from another tab) or local-only (failed before agy started), so index order is unreliable.
+   */
+  function alignTurnsToPartitions(turns, partitions) {
+    const users = partitions.map(partitionUserStep);
+    const partNorm = users.map((u) => normPrompt(u?.content));
+    const partOf = new Map();
+    const used = new Set();
+    const take = (t, pi) => { partOf.set(t, pi); used.add(pi); };
+    const isGenerated = (t) => /^t_[0-9a-f-]{36}_\d+$/i.test(t.id || "");
+    const matches = (t, pi) => {
+      const a = normPrompt(t.prompt);
+      const b = partNorm[pi];
+      return !!a && !!b && (a === b || b.startsWith(a) || a.startsWith(b));
+    };
+
+    for (const t of turns) {
+      if (t.txUser == null) continue;
+      const pi = users.findIndex((u) => u && u.step_index === t.txUser);
+      if (pi >= 0 && !used.has(pi)) take(t, pi);
+    }
+
+    const local = turns.filter((t) => !isGenerated(t));
+    local.forEach((t, k) => {
+      if (partOf.has(t)) return;
+      let lo = 0;
+      let hi = partitions.length - 1;
+      for (let j = k - 1; j >= 0; j--) if (partOf.has(local[j])) { lo = partOf.get(local[j]) + 1; break; }
+      for (let j = k + 1; j < local.length; j++) if (partOf.has(local[j])) { hi = partOf.get(local[j]) - 1; break; }
+      for (let pi = lo; pi <= hi; pi++) if (!used.has(pi) && matches(t, pi)) { take(t, pi); break; }
+    });
+
+    const live = turns.find((t) => t.status === "running");
+    if (live && !partOf.has(live) && partitions.length) {
+      const pi = partitions.length - 1;
+      const at = Date.parse(users[pi]?.created_at || "") || 0;
+      if (!used.has(pi) && at && at >= (live.startedAt || 0) - 120000) take(live, pi);
+    }
+
+    if (turns.length === partitions.length) {
+      turns.forEach((t, i) => { if (!partOf.has(t) && !isGenerated(t) && !used.has(i)) take(t, i); });
+    }
+
+    for (const t of turns) {
+      if (partOf.has(t) || !isGenerated(t)) continue;
+      const pi = partitions.findIndex((_, k) => !used.has(k) && matches(t, k));
+      if (pi >= 0) take(t, pi);
+    }
+
+    if (live) return partOf;
+    for (let i = turns.length - 1; i >= 0; i--) {
+      if (!partOf.has(turns[i]) && isGenerated(turns[i])) turns.splice(i, 1);
+    }
+    let key = -1;
+    const order = turns.map((t, i) => {
+      if (partOf.has(t)) key = partOf.get(t);
+      return { t, i, o: partOf.has(t) ? key : key + 0.5 };
+    });
+    order.sort((a, b) => a.o - b.o || a.i - b.i);
+    order.forEach((r, i) => { turns[i] = r.t; });
+    return partOf;
+  }
+
   const transcriptLoadingSet = new Set();
   async function enrichTurnFromTranscript(conv, targetTurn) {
     const cid = conv?.conversationId;
     if (!cid || transcriptLoadingSet.has(cid)) return;
     transcriptLoadingSet.add(cid);
     try {
-      const data = await api(`/v1/transcripts/${encodeURIComponent(cid)}?limit=1500`, { timeoutMs: 12000 });
+      const data = await api(`/v1/transcripts/${encodeURIComponent(cid)}?limit=5000`, { timeoutMs: 12000 });
       if (!data?.ok || !Array.isArray(data.steps)) return;
 
       if (!conv.turns) conv.turns = [];
@@ -2441,31 +2982,45 @@
 
       const hasLiveTurn = turns.some((t) => t.status === "running");
       let needRerender = false;
-      if (partitions.length > turns.length && !hasLiveTurn) {
-        for (let pi = turns.length; pi < partitions.length; pi++) {
-          const p = partitions[pi];
-          const userStep = p.find((s) => /^user_input$/i.test(String(s.type || "")));
-          const rawPrompt = userStep?.content || "";
-          const cleanPrompt = cleanUserPrompt(rawPrompt) || (pi === 0 ? conv.title : "用户输入");
-          turns.push({
+      const orderBefore = turns.slice();
+      const partOf = alignTurnsToPartitions(turns, partitions);
+      if (turns.length !== orderBefore.length || turns.some((t, i) => t !== orderBefore[i])) needRerender = true;
+      if (!hasLiveTurn) {
+        const used = new Set(partOf.values());
+        for (let pi = 0; pi < partitions.length; pi++) {
+          if (used.has(pi)) continue;
+          const userStep = partitionUserStep(partitions[pi]);
+          const at = userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now();
+          const nt = {
             id: `t_${conv.conversationId}_${pi}`,
-            prompt: cleanPrompt,
-            at: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
-            startedAt: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
-            endedAt: userStep?.created_at ? new Date(userStep.created_at).getTime() : Date.now(),
+            prompt: cleanUserPrompt(userStep?.content || "") || (pi === 0 ? conv.title : "用户输入"),
+            at, startedAt: at, endedAt: at,
             status: "done",
             blocks: [],
-          });
+            txUser: userStep?.step_index ?? null,
+          };
+          let pos = turns.length;
+          for (let k = 0; k < turns.length; k++) {
+            const q = partOf.get(turns[k]);
+            if (q != null && q > pi) { pos = k; break; }
+          }
+          turns.splice(pos, 0, nt);
+          partOf.set(nt, pi);
           needRerender = true;
         }
       }
 
       let updated = false;
+      const signals = scanTranscriptSignals(data.steps);
       for (let i = 0; i < turns.length; i++) {
         const t = turns[i];
         if (targetTurn && t !== targetTurn && (t.thoughts || t.thinking)) continue;
-        const part = partitions[i];
+        const pi = partOf.get(t);
+        const part = pi == null ? null : partitions[pi];
         if (!part) continue;
+        const us = partitionUserStep(part);
+        if (us && t.txUser !== us.step_index) { t.txUser = us.step_index; updated = true; }
+        let changed = false;
 
         const thoughts = [];
         for (const s of part) {
@@ -2473,12 +3028,11 @@
             thoughts.push({ step_index: s.step_index, thinking: s.thinking.trim(), created_at: s.created_at });
           }
         }
-
-        if (thoughts.length > 0) {
+        const thoughtSig = (list) => (list || []).map((x) => x.thinking).join("\u0001");
+        if (thoughts.length > 0 && thoughtSig(thoughts) !== thoughtSig(t.thoughts)) {
           t.thoughts = thoughts;
           t.thinking = thoughts.map((x) => x.thinking).join("\n\n---\n\n");
-          if (attached(t)) paintAllBlocks(t);
-          updated = true;
+          changed = true;
         }
 
         // Clean XML tags from turn prompt if present
@@ -2490,98 +3044,32 @@
           }
         }
 
-        // Restore complete tool blocks if missing or incomplete
-        const partTools = [];
-        for (let idx = 0; idx < part.length; idx++) {
-          const s = part[idx];
-          if (s.tool_calls) {
-            const nextStep = part[idx + 1];
-            const output = nextStep && (nextStep.type === "GENERIC" || nextStep.type === "TOOL_OUTPUT" || nextStep.source === "MODEL") ? nextStep.content : null;
-            for (const tc of (Array.isArray(s.tool_calls) ? s.tool_calls : [s.tool_calls])) {
-              const toolName = tc.name || tc.tool_name || tc.function?.name || "tool";
-              const rawParams = tc.args ?? tc.arguments ?? tc.parameters ?? tc.input;
-              const pt = {
-                kind: toolName === "invoke_subagent" ? "subagent" : "tool",
-                key: `tx-${s.step_index}`,
-                name: toolName,
-                params: rawParams,
-                output: output,
-                state: "done",
-              };
-              if (toolName === "invoke_subagent") {
-                pt.subagents = extractSubagentsFromToolBlock(pt);
-              }
-              partTools.push(pt);
-            }
-          }
-        }
-        if (partTools.length > 0) {
-          const nonTools = (t.blocks || []).filter((b) => b.kind !== "tool" && b.kind !== "subagent");
-          const existingTools = (t.blocks || []).filter((b) => b.kind === "tool" || b.kind === "subagent");
-          const needReplace =
-            existingTools.length < partTools.length ||
-            existingTools.some(
-              (b) =>
-                !b.params ||
-                (b.name === "invoke_subagent" && (!b.subagents || !b.subagents.length))
-            );
-          if (needReplace) {
-            t.blocks = [...partTools, ...nonTools];
-            if (attached(t)) paintAllBlocks(t);
-            updated = true;
-          }
-        }
+        if (mergeTranscriptSteps(t, part, signals)) changed = true;
 
-        // Clean any leaking tool output text blocks
-        if (Array.isArray(t.blocks)) {
-          t.blocks = t.blocks.filter((b) => !(b.kind === "text" && isToolOutputText(b.text)));
-        }
-
-        // If the turn is actively running via SSE, live stream is already receiving and painting
-        // text deltas in real-time. Do not inject or overwrite text blocks from transcript poller.
         if (t.status === "running") {
-          continue;
-        }
-
-        // Restore or update response text from transcript
-        const textSteps = part.filter((s) =>
-          /planner_response|agent_response|model_response|text/i.test(`${s.type || ""}`) &&
-          s.content && typeof s.content === "string" && s.content.trim() &&
-          !isToolOutputText(s.content)
-        );
-        if (textSteps.length > 0) {
-          for (const ts of textSteps) {
-            if (!t.blocks) t.blocks = [];
-            const key = `t${ts.step_index}`;
-            let textBlock = t.blocks.find((b) => b.key === key || (textSteps.length === 1 && b.key === "final-tx"));
-            if (!textBlock) {
-              t.blocks.push({ kind: "text", key, text: ts.content });
-              if (attached(t)) paintAllBlocks(t);
-              updated = true;
-            } else if (textBlock.text !== ts.content && ts.content.length > (textBlock.text || "").length) {
-              textBlock.text = ts.content;
-              if (attached(t)) paintAllBlocks(t);
-              updated = true;
-            }
+          const last = part[part.length - 1];
+          if (last && last.step_index !== t._txLast?.idx) {
+            t._txLast = { idx: last.step_index, at: Date.parse(last.created_at) || null, desc: describeTranscriptStep(last) };
+            paintLive(t);
           }
-        } else {
+        } else if (!(t.blocks || []).some((b) => b.kind === "text")) {
           const lastModel = [...part].reverse().find((s) =>
             s.content && typeof s.content === "string" && s.content.trim() &&
             !/generic|system_message|tool_output|user_input/i.test(`${s.type || ""}`) &&
             !isToolOutputText(s.content)
           );
           if (lastModel?.content) {
-            if (!t.blocks) t.blocks = [];
-            let textBlock = t.blocks.find((b) => b.kind === "text");
-            if (!textBlock) {
-              t.blocks.push({ kind: "text", key: "final-tx", text: lastModel.content });
-              if (attached(t)) paintAllBlocks(t);
-              updated = true;
-            } else if (textBlock.text !== lastModel.content && lastModel.content.length > (textBlock.text || "").length) {
-              textBlock.text = lastModel.content;
-              if (attached(t)) paintAllBlocks(t);
-              updated = true;
-            }
+            t.blocks.push({ kind: "text", key: "final-tx", text: lastModel.content });
+            changed = true;
+          }
+        }
+
+        if (changed) {
+          updated = true;
+          if (attached(t)) {
+            paintAllBlocks(t);
+            updateCaret(t);
+            paintLive(t);
           }
         }
       }
@@ -2623,10 +3111,12 @@
       paintHead(turn);
       paintWait(turn);
       updateCaret(turn);
+      paintLive(turn);
       paintFoot(turn);
       for (const [id, tx] of turn._v.tx) {
         clearInterval(tx.timer);
         tx.timer = null;
+        tx.el.classList.remove("live");
         if (tx.open) loadTranscriptInto(id, tx);
       }
       if (stick) scrollBottom();
@@ -3773,7 +4263,7 @@
     streaming_steps: "流式步骤 (SSE)",
     subagent_events: "子代理事件",
     subagent_thinking_via_transcript: "子代理思考（transcript）",
-    parallel_agent_default: "默认并行 Agent (agy-fast)",
+    parallel_agent_default: "默认 Agent（与官方桌面端一致）",
     main_agent_thinking_stream: "主代理独立思考流",
     ai_credits_balance: "AI Credits 余额",
     interactive_agents_panel_kill: "单独终止某个子代理",
@@ -4077,9 +4567,8 @@
     if (e.key === "/" && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName || "")) { e.preventDefault(); promptInput.focus(); }
   });
 
-  window.addEventListener("beforeunload", (e) => {
+  window.addEventListener("beforeunload", () => {
     saveNow();
-    if (state.live.size) { e.preventDefault(); e.returnValue = ""; }
   });
 
   async function syncConvsFromBackend() {
@@ -4140,6 +4629,7 @@
   loadUsage(false);
   loadAccountQuotas(false);
   syncConvsFromBackend();
+  reattachRuns();
   setInterval(loadHealth, 30000);
   setInterval(loadRuns, 15000);
   setInterval(() => { if (!document.hidden && state.connected) loadUsage(false); }, 5 * 60000);

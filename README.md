@@ -19,7 +19,7 @@ Turn Antigravity into a headless, auto-approving agent service you can drive fro
 ## Features
 
 - **Auto-approve** every tool call in headless mode
-- **Parallel agent (`agy-fast`)** — default agent that batches file tools and spawns `invoke_subagent` instead of serial one-by-one reads
+- **Built-in default agent** — same agent and tools as the Antigravity desktop app (override per request with `agent`)
 - **SSE streaming** — `text_delta` / `tool` / `subagent` / `result`
 - **Account switcher** — save & restore Windows Credential Manager snapshots
 - **Model list + prefs** — default model / cwd / agent

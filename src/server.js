@@ -36,8 +36,6 @@ import {
   setPrefs,
 } from "./models.js";
 import { getUsage, recordLocalUsage, fetchAllAccountsQuotas, invalidateUsageCache } from "./usage.js";
-import { ensureBundledAgents, DEFAULT_AGENT_ID } from "./ensureAgent.js";
-
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || "127.0.0.1";
 const API_KEY = process.env.AGY_API_KEY || "";
@@ -53,6 +51,48 @@ const MIME = {
   ".ico": "image/x-icon",
   ".woff2": "font/woff2",
 };
+
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream; charset=utf-8",
+  "Cache-Control": "no-cache, no-transform",
+  Connection: "keep-alive",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key",
+  "X-Accel-Buffering": "no",
+};
+
+// Stream runs outlive their SSE connection: a page refresh re-attaches via
+// GET /v1/agent/stream/<run_id>?after=<seq> instead of killing agy.
+const STREAM_BUFFER_MAX = 5000;
+const STREAM_KEEP_MS = 15 * 60 * 1000;
+const streamRuns = new Map();
+
+function writeSse(res, event, data) {
+  if (res.writableEnded || res.destroyed) return;
+  if (event) res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function publishRunEvent(run, event, data) {
+  const payload = { ...data, seq: ++run.seq, ts: Date.now() };
+  const { raw, ...slim } = payload;
+  run.events.push({ event, data: slim });
+  if (run.events.length > STREAM_BUFFER_MAX) run.events.splice(0, run.events.length - STREAM_BUFFER_MAX);
+  for (const c of run.clients) writeSse(c, event, payload);
+}
+
+function closeStreamRun(run) {
+  run.done = true;
+  for (const c of run.clients) if (!c.writableEnded) c.end();
+  run.clients.clear();
+  setTimeout(() => streamRuns.delete(run.id), STREAM_KEEP_MS).unref?.();
+}
+
+setInterval(() => {
+  for (const run of streamRuns.values()) {
+    for (const c of run.clients) if (!c.writableEnded && !c.destroyed) c.write(": ping\n\n");
+  }
+}, 25000).unref?.();
 
 const UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
 const UPLOAD_ALLOWED_EXT = new Set([
@@ -510,7 +550,8 @@ const server = http.createServer(async (req, res) => {
       if (!id) throw bad("conversation id required");
       const limit = Number(url.searchParams.get("limit") || 500);
       const includeThinking = url.searchParams.get("thinking") !== "0";
-      const data = await readTranscript(id, { limit, includeThinking });
+      const tail = url.searchParams.get("tail") === "1";
+      const data = await readTranscript(id, { limit, includeThinking, tail });
       return sendJson(res, data.ok ? 200 : 404, data);
     }
 
@@ -572,7 +613,7 @@ const server = http.createServer(async (req, res) => {
           streaming_steps: true,
           subagent_events: true,
           subagent_thinking_via_transcript: true,
-          parallel_agent_default: "agy-fast (batch tools + invoke_subagent)",
+          parallel_agent_default: "built-in default agent (same as desktop)",
           main_agent_thinking_stream: false,
           ai_credits_balance: false,
           interactive_agents_panel_kill: "partial (abort whole run only)",
@@ -590,6 +631,7 @@ const server = http.createServer(async (req, res) => {
           "GET /v1/runs",
           "POST /v1/agent",
           "POST /v1/agent/stream",
+          "GET /v1/agent/stream/:run_id?after=:seq",
           "POST /v1/agent/abort",
           "GET /v1/transcripts/:id",
           "POST /v1/conversations/purge",
@@ -659,26 +701,12 @@ const server = http.createServer(async (req, res) => {
         body.run_id ||
         `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key",
-        "X-Accel-Buffering": "no",
-      });
+      res.writeHead(200, SSE_HEADERS);
 
-      const sendEvent = (event, data) => {
-        if (res.writableEnded) return;
-        if (event) res.write(`event: ${event}\n`);
-        res.write(`data: ${JSON.stringify(data)}\n\n`);
-      };
-
-      let closed = false;
-      req.on("close", () => {
-        closed = true;
-        abortRun(runId);
-      });
+      const run = { id: runId, events: [], seq: 0, clients: new Set([res]), done: false };
+      streamRuns.set(runId, run);
+      res.on("close", () => run.clients.delete(res));
+      const sendEvent = (event, data) => publishRunEvent(run, event, data);
 
       try {
         const summary = await runAgyStream(
@@ -696,10 +724,7 @@ const server = http.createServer(async (req, res) => {
             mode: body.mode,
             extraArgs: body.extra_args,
           },
-          (evt) => {
-            if (closed) return;
-            sendEvent(evt.type || "message", evt);
-          }
+          (evt) => sendEvent(evt.type || "message", evt)
         );
 
         try {
@@ -719,38 +744,51 @@ const server = http.createServer(async (req, res) => {
           /* ignore */
         }
 
-        if (!closed) {
-          sendEvent("done", {
-            ok: true,
-            run_id: summary.runId,
-            conversation_id: summary.conversationId,
-            status: summary.status,
-            response: summary.response,
-            usage: summary.usage,
-            subagents: summary.subagents,
-            model: model || null,
-          });
-          res.end();
-        }
+        sendEvent("done", {
+          ok: true,
+          run_id: summary.runId,
+          conversation_id: summary.conversationId,
+          status: summary.status,
+          response: summary.response,
+          usage: summary.usage,
+          subagents: summary.subagents,
+          model: model || null,
+        });
       } catch (err) {
-        if (!closed && !res.writableEnded) {
-          sendEvent("error", {
-            message: err.message,
-            code: err.code || "INTERNAL",
-            result: err.result
-              ? {
-                  conversation_id: err.result.conversationId,
-                  status: err.result.status,
-                  response: err.result.response,
-                  usage: err.result.usage,
-                  subagents: err.result.subagents,
-                  stderr: err.result.stderr?.slice?.(0, 2000),
-                }
-              : undefined,
-          });
-          res.end();
-        }
+        sendEvent("error", {
+          message: err.message,
+          code: err.code || "INTERNAL",
+          result: err.result
+            ? {
+                conversation_id: err.result.conversationId,
+                status: err.result.status,
+                response: err.result.response,
+                usage: err.result.usage,
+                subagents: err.result.subagents,
+                stderr: err.result.stderr?.slice?.(0, 2000),
+              }
+            : undefined,
+        });
+      } finally {
+        closeStreamRun(run);
       }
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/v1/agent/stream/")) {
+      const runId = decodeURIComponent(url.pathname.slice("/v1/agent/stream/".length));
+      const run = streamRuns.get(runId);
+      if (!run) return sendJson(res, 404, { ok: false, error: "run not found", run_id: runId });
+      const after = Number(url.searchParams.get("after") || 0);
+      res.writeHead(200, SSE_HEADERS);
+      writeSse(res, "reattached", { run_id: runId, done: run.done, latest_seq: run.seq });
+      for (const e of run.events) if (e.data.seq > after) writeSse(res, e.event, e.data);
+      if (run.done) {
+        res.end();
+        return;
+      }
+      run.clients.add(res);
+      res.on("close", () => run.clients.delete(res));
       return;
     }
 
@@ -820,19 +858,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  try {
-    const installed = ensureBundledAgents();
-    console.log(
-      `[agy-auto] agent ${DEFAULT_AGENT_ID}: ${installed.path}${installed.updated ? " (updated)" : ""}`
-    );
-  } catch (err) {
-    console.warn(`[agy-auto] failed to install bundled agent: ${err.message}`);
-  }
   console.log(`[agy-auto] listening on http://${HOST}:${PORT}`);
   console.log(`[agy-auto] agy binary: ${resolveAgyBinary()}`);
   console.log(`[agy-auto] auto-approve: --dangerously-skip-permissions`);
   console.log(`[agy-auto] mode: ${process.env.AGY_MODE || "accept-edits"}`);
-  console.log(`[agy-auto] default agent: ${resolveDefaultAgent(getPrefs().defaultAgent)}`);
+  console.log(`[agy-auto] default agent: ${resolveDefaultAgent(getPrefs().defaultAgent) || "(built-in)"}`);
   console.log(`[agy-auto] default cwd: ${DEFAULT_CWD}`);
   try {
     console.log(`[agy-auto] account: ${JSON.stringify(whoami())}`);

@@ -5,7 +5,7 @@ import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
 import { applyActiveProfileEnv } from "./accounts.js";
-import { resolveAgyBinary as _resolveAgyBinaryShared } from "./utils.js";
+import { resolveAgyBinary as _resolveAgyBinaryShared, envWithAgyPath } from "./utils.js";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.AGY_TIMEOUT_MS || 0);
 
@@ -28,18 +28,15 @@ export function buildAgyArgs({
   printTimeout,
   mode,
   extraArgs = [],
+  stdinPrompt = false,
 } = {}) {
   if (!prompt || !String(prompt).trim()) {
     throw new Error("prompt is required");
   }
 
-  const args = [
-    "--print",
-    String(prompt),
-    "--dangerously-skip-permissions",
-    "--output-format",
-    outputFormat,
-  ];
+  const args = stdinPrompt
+    ? ["--input-format", "stream-json", "--dangerously-skip-permissions", "--output-format", "stream-json"]
+    : ["--print", String(prompt), "--dangerously-skip-permissions", "--output-format", outputFormat];
 
   // accept-edits matches IDE “just do the edits” flow; still needs skip-permissions in print mode
   const execMode = mode || process.env.AGY_MODE || "accept-edits";
@@ -68,12 +65,14 @@ function spawnAgy(options) {
   const env = applyActiveProfileEnv(process.env);
   const child = spawn(bin, args, {
     cwd,
-    env: {
-      ...env,
-      PATH: `${path.dirname(bin)}${path.delimiter}${env.PATH || ""}`,
-    },
+    env: envWithAgyPath(env, path.dirname(bin)),
     windowsHide: true,
   });
+  // Windows caps command lines at ~32K chars, so long prompts go through stdin as a stream-json "user" event.
+  if (options.stdinPrompt) {
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify({ event: "user", message: { content: String(options.prompt) } }) + "\n", "utf8");
+  }
   return { bin, args, cwd, child };
 }
 
@@ -636,7 +635,7 @@ export function resolveTranscriptPath(idOrUri) {
   return candidates[0]; // default expected path
 }
 
-export async function readTranscript(idOrUri, { limit = 500, includeThinking = true } = {}) {
+export async function readTranscript(idOrUri, { limit = 500, includeThinking = true, tail = false } = {}) {
   const filePath = resolveTranscriptPath(idOrUri);
   if (!filePath || !existsSync(filePath)) {
     return {
@@ -647,6 +646,7 @@ export async function readTranscript(idOrUri, { limit = 500, includeThinking = t
     };
   }
   const steps = [];
+  let total = 0;
   const rl = readline.createInterface({
     input: createReadStream(filePath, { encoding: "utf8" }),
     crlfDelay: Infinity,
@@ -667,8 +667,15 @@ export async function readTranscript(idOrUri, { limit = 500, includeThinking = t
         tool_calls: row.tool_calls || null,
       };
       if (includeThinking) step.thinking = row.thinking || null;
+      total++;
       steps.push(step);
-      if (steps.length >= limit) break;
+      if (steps.length > limit) {
+        if (!tail) {
+          steps.pop();
+          break;
+        }
+        steps.shift();
+      }
     } catch {
       /* skip bad line */
     }
@@ -676,6 +683,7 @@ export async function readTranscript(idOrUri, { limit = 500, includeThinking = t
   return {
     ok: true,
     path: filePath,
+    total,
     conversation_id: path.basename(path.dirname(path.dirname(path.dirname(filePath)))),
     steps,
     note: "Subagent transcripts often include `thinking` text; main CLI stream-json does not expose a separate thought channel.",
@@ -861,7 +869,7 @@ export function listAgents(cwd = process.cwd()) {
     {
       id: "default",
       name: "Default agent",
-      description: "Built-in Antigravity default — often serial tool use",
+      description: "Built-in Antigravity default (same as desktop)",
       scope: "builtin",
     },
   ];
@@ -881,7 +889,7 @@ export function listAgents(cwd = process.cwd()) {
     }
   }
   agents.sort((a, b) => {
-    const score = (x) => (x.id === "agy-fast" ? 0 : x.id === "default" ? 2 : 1);
+    const score = (x) => (x.id === "default" ? 0 : 1);
     return score(a) - score(b) || String(a.name).localeCompare(String(b.name));
   });
   return agents;

@@ -20,6 +20,22 @@ export function writeJson(p, obj) {
   writeFileSync(p, JSON.stringify(obj, null, 2) + "\n", "utf8");
 }
 
+// ─── child process env ───────────────────────────────────────────────────────
+
+/**
+ * Copy `baseEnv` with `binDir` prepended to PATH.
+ * Windows env keys are case-insensitive (`Path`), but a spread object is not —
+ * collapse every PATH variant into one key so the child doesn't get two.
+ */
+export function envWithAgyPath(baseEnv, binDir) {
+  const env = { ...baseEnv };
+  const keys = Object.keys(env).filter((k) => k.toUpperCase() === "PATH");
+  const current = keys.map((k) => env[k]).find((v) => v) || "";
+  for (const k of keys) delete env[k];
+  env[keys[0] || "PATH"] = current ? `${binDir}${path.delimiter}${current}` : binDir;
+  return env;
+}
+
 // ─── agy binary resolution (single source of truth) ─────────────────────────
 
 /**

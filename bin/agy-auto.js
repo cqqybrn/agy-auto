@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { resolveAgyBinary, runAgy } from "../src/agyRunner.js";
+import { envWithAgyPath } from "../src/utils.js";
 import {
   applyActiveProfileEnv,
   clearLiveAuth,
@@ -247,10 +248,7 @@ async function main() {
     const child = spawn(bin, args, {
       cwd: opts.cwd,
       stdio: "inherit",
-      env: {
-        ...env,
-        PATH: `${path.dirname(bin)}${path.delimiter}${env.PATH || ""}`,
-      },
+      env: envWithAgyPath(env, path.dirname(bin)),
     });
     child.on("exit", (code) => process.exit(code ?? 1));
     return;

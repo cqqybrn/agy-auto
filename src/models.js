@@ -4,7 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { applyActiveProfileEnv } from "./accounts.js";
 import { resolveAgyBinary } from "./agyRunner.js";
-import { readJson, writeJson } from "./utils.js";
+import { readJson, writeJson, envWithAgyPath } from "./utils.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, "..");
@@ -20,10 +20,7 @@ export function listModels() {
   const env = applyActiveProfileEnv(process.env);
   const r = spawnSync(bin, ["models"], {
     encoding: "utf8",
-    env: {
-      ...env,
-      PATH: `${path.dirname(bin)}${path.delimiter}${env.PATH || ""}`,
-    },
+    env: envWithAgyPath(env, path.dirname(bin)),
     windowsHide: true,
     timeout: 60_000,
   });
@@ -94,8 +91,9 @@ export function resolveDefaultModel(explicit) {
 }
 
 /**
- * Prefer explicit agent → prefs → AGY_DEFAULT_AGENT → bundled agy-fast.
- * Pass null/""/"default"/"builtin" to force the built-in default agent (no --agent flag).
+ * Prefer explicit agent → prefs → AGY_DEFAULT_AGENT → built-in default agent
+ * (no --agent flag, same as the Antigravity desktop app).
+ * Pass "default"/"builtin"/"-" to force the built-in default agent.
  */
 export function resolveDefaultAgent(explicit) {
   const raw =
@@ -110,5 +108,5 @@ export function resolveDefaultAgent(explicit) {
   const env = (process.env.AGY_DEFAULT_AGENT || "").trim();
   if (env === "default" || env === "builtin" || env === "-") return undefined;
   if (env) return env;
-  return "agy-fast";
+  return undefined;
 }
