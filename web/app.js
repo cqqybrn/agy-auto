@@ -827,7 +827,7 @@
     if (/claude/i.test(g)) return "c";
     return "";
   }
-  const effectiveModel = () => state.model || state.prefs.defaultModel || null;
+  const effectiveModel = () => state.model || state.prefs.defaultModel || "gemini-3.8-flash-high";
   const effectiveCwd = () => state.cwd || state.prefs.defaultCwd || state.health?.cwd || "";
 
   function bucketPct(b) {
@@ -2158,7 +2158,7 @@
     if (!conv.title || conv.title === "New conversation") conv.title = oneLine(prompt, 60);
 
     const payload = { prompt: agentPrompt || prompt, run_id: runId };
-    if (state.model) payload.model = state.model;
+    payload.model = state.model || effectiveModel() || "gemini-3.8-flash-high";
     if (cwd) payload.cwd = cwd;
     if (conv.conversationId) payload.conversation_id = conv.conversationId;
     if (state.printTimeout) payload.print_timeout = state.printTimeout;

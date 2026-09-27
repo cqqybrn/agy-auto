@@ -1,7 +1,7 @@
 ---
 name: agy-fast
 description: Internal agent for agy-auto CLI (parallel tools + subagents). Not for interactive Antigravity chat.
-mainAgent: false
+mainAgent: true
 subagent: true
 model: inherit
 commandExecutionPolicy: eager

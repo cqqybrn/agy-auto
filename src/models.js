@@ -90,7 +90,7 @@ export function resolveDefaultModel(explicit) {
   if (explicit && !["antigravity", "agy", "default"].includes(explicit)) {
     return explicit;
   }
-  return getPrefs().defaultModel || undefined;
+  return getPrefs().defaultModel || "gemini-3.8-flash-high";
 }
 
 /**
